@@ -1,0 +1,32 @@
+{
+  "name": "btc5-15-arbitrage-bot",
+  "version": "1.0.0",
+  "description": "Production-grade BTC 5-15 minute binary prediction market arbitrage bot",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "ts-node src/index.ts",
+    "watch": "tsc --watch",
+    "simulate": "ts-node src/simulate.ts"
+  },
+  "keywords": ["polymarket", "arbitrage", "trading", "btc", "binary-options"],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "@types/node": "^20.0.0",
+    "dotenv": "^16.4.5",
+    "ethers": "^6.16.0",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.9.3",
+    "ws": "^8.18.0",
+    "@types/ws": "^8.5.10",
+    "mongodb": "^6.3.0",
+    "uuid": "^9.0.1",
+    "@types/uuid": "^9.0.7"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0"
+  }
+}
