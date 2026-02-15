@@ -169,7 +169,7 @@ export class SimulationEngine {
       beatPrice: {
         value: historical.beatPrice,
         timestamp: historical.startTime,
-        source: "historical",
+        source: "calculated",
       },
       tokens: {
         upTokenId: `up_${historical.marketId}`,

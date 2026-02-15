@@ -1,18 +1,19 @@
 /**
  * Atomic trade execution system with parallel orders and timeout
  * Requirement: ≤50ms fill timeout, cancel other order if one fails
+ * Implements EOA wallet approval and actual CLOB order placement
  */
 
 import type { TradeParams, TradeExecution, TradeStatus } from "../types";
 import { logInfo, logError, logWarn, logDebug } from "../utils/logger";
 import { getConfig } from "../config";
-// Simple UUID generator (in production, use uuid package)
+import { ClobClient } from "../clients/clob-client";
+
+// Simple UUID generator
 function generateUUID(): string {
   return `${Date.now()}-${Math.random().toString(36).substr(2, 9)}-${Math.random().toString(36).substr(2, 9)}`;
 }
 
-// Note: This is a placeholder structure. In production, you would use
-// @polymarket/clob-client or similar for actual order execution
 interface OrderResult {
   success: boolean;
   orderId?: string;
@@ -23,7 +24,34 @@ interface OrderResult {
 
 export class TradeExecutor {
   private config = getConfig();
+  private clobClient: ClobClient;
   private pendingOrders: Map<string, { cancel: () => Promise<void> }> = new Map();
+  private approvalDone = false;
+
+  constructor() {
+    try {
+      this.clobClient = new ClobClient();
+    } catch (error) {
+      logError("Failed to initialize CLOB client:", error);
+      throw error;
+    }
+  }
+
+  /**
+   * Ensure wallet is approved (call before first trade)
+   */
+  async ensureApproved(): Promise<boolean> {
+    if (this.approvalDone) {
+      return true;
+    }
+
+    logInfo("Ensuring wallet approval...");
+    const success = await this.clobClient.approve();
+    if (success) {
+      this.approvalDone = true;
+    }
+    return success;
+  }
 
   /**
    * Execute atomic arbitrage trade (requirement 6)
@@ -139,7 +167,7 @@ export class TradeExecutor {
   }
 
   /**
-   * Execute a single order
+   * Execute a single order using CLOB API
    */
   private async executeOrder(
     tokenId: string,
@@ -149,29 +177,40 @@ export class TradeExecutor {
     limitPrice?: number,
   ): Promise<OrderResult> {
     try {
-      // TODO: Implement actual order execution using CLOB client
-      // This is a placeholder that simulates order execution
-      logDebug(`Executing ${orderType} order: token=${tokenId}, price=${price}, qty=${quantity}`);
+      // Ensure approval is done
+      if (!this.approvalDone) {
+        await this.ensureApproved();
+      }
 
-      // Simulate API call delay
-      await new Promise((resolve) => setTimeout(resolve, 10 + Math.random() * 20));
+      const executionPrice = orderType === "market" ? price : (limitPrice || price);
+      logDebug(`Executing ${orderType} order: token=${tokenId.substring(0, 20)}..., price=${executionPrice}, qty=${quantity}`);
 
-      // Simulate success/failure
-      const success = Math.random() > 0.1; // 90% success rate
+      // Place order via CLOB API (FOK for immediate execution)
+      // According to Polymarket docs: FOK orders must fill completely or are cancelled
+      const response = await this.clobClient.placeBuyOrder(
+        tokenId,
+        executionPrice,
+        quantity,
+        "FOK", // Fill or Kill for atomic execution
+      );
 
-      if (success) {
-        return {
-          success: true,
-          orderId: `order_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
-          status: orderType === "market" ? "filled" : "open",
-          filled: orderType === "market",
-        };
-      } else {
+      if (response.error) {
         return {
           success: false,
-          error: "Simulated order failure",
+          error: response.error,
         };
       }
+
+      // Check if order was filled immediately (FOK orders either fill or fail)
+      // Status can be: "matched", "live", "delayed", "unmatched" per Polymarket docs
+      const isFilled = response.status === "matched" || response.status === "MATCHED";
+
+      return {
+        success: true,
+        orderId: response.orderID,
+        status: response.status || (isFilled ? "matched" : "unmatched"),
+        filled: isFilled,
+      };
     } catch (error) {
       logError(`Order execution error:`, error);
       return {
@@ -182,17 +221,156 @@ export class TradeExecutor {
   }
 
   /**
-   * Cancel an order
+   * Execute both orders atomically using batch orders endpoint
+   * According to https://docs.polymarket.com/developers/CLOB/orders/create-order-batch
+   * This is better for atomic execution than placing orders separately
+   */
+  async executeTradeBatch(params: TradeParams): Promise<TradeExecution> {
+    const tradeId = generateUUID();
+    const startTime = Date.now();
+
+    logInfo(`Executing batch trade ${tradeId}: UP in ${params.upMarket}, DOWN in ${params.downMarket}`);
+
+    try {
+      // Ensure approval is done
+      if (!this.approvalDone) {
+        await this.ensureApproved();
+      }
+
+      // Create batch order request
+      const orderType: "FOK" | "FAK" | "GTC" | "GTD" = params.orderType === "market" ? "FOK" : "GTC";
+      const orders = [
+        {
+          tokenId: params.upTokenId,
+          price: params.upPrice,
+          size: params.quantity,
+          side: "BUY" as const,
+          orderType,
+        },
+        {
+          tokenId: params.downTokenId,
+          price: params.downPrice,
+          size: params.quantity,
+          side: "BUY" as const,
+          orderType,
+        },
+      ];
+
+      // Place batch orders
+      const results = await this.clobClient.placeBatchOrders(orders);
+      const latency = Date.now() - startTime;
+
+      // Check timeout
+      if (latency > this.config.executionTimeoutMs) {
+        logWarn(`Trade ${tradeId} exceeded timeout: ${latency}ms > ${this.config.executionTimeoutMs}ms`);
+        // Cancel both orders if they were placed
+        for (const result of results) {
+          if (result.orderID) {
+            await this.cancelOrder(result.orderID);
+          }
+        }
+        return this.createTradeExecution(
+          tradeId,
+          params,
+          latency,
+          "failed",
+          results[0]?.orderID,
+          results[1]?.orderID,
+          "Execution timeout exceeded",
+        );
+      }
+
+      // Process results
+      const upResult = results[0];
+      const downResult = results[1];
+
+      // If one order fails, cancel the other
+      if (upResult.error && !downResult.error) {
+        logWarn(`UP order failed, canceling DOWN order`);
+        if (downResult.orderID) {
+          await this.cancelOrder(downResult.orderID);
+        }
+        return this.createTradeExecution(
+          tradeId,
+          params,
+          latency,
+          "failed",
+          upResult.orderID,
+          downResult.orderID,
+          `UP order failed: ${upResult.error}`,
+        );
+      }
+
+      if (!upResult.error && downResult.error) {
+        logWarn(`DOWN order failed, canceling UP order`);
+        if (upResult.orderID) {
+          await this.cancelOrder(upResult.orderID);
+        }
+        return this.createTradeExecution(
+          tradeId,
+          params,
+          latency,
+          "failed",
+          upResult.orderID,
+          downResult.orderID,
+          `DOWN order failed: ${downResult.error}`,
+        );
+      }
+
+      if (upResult.error && downResult.error) {
+        return this.createTradeExecution(
+          tradeId,
+          params,
+          latency,
+          "failed",
+          upResult.orderID,
+          downResult.orderID,
+          `Both orders failed: UP=${upResult.error}, DOWN=${downResult.error}`,
+        );
+      }
+
+      // Both orders succeeded
+      const upFilled = upResult.status === "matched";
+      const downFilled = downResult.status === "matched";
+      const status: TradeStatus = upFilled && downFilled ? "filled" : "pending";
+
+      return this.createTradeExecution(
+        tradeId,
+        params,
+        latency,
+        status,
+        upResult.orderID,
+        downResult.orderID,
+        undefined,
+      );
+    } catch (error) {
+      const latency = Date.now() - startTime;
+      logError(`Batch trade execution error:`, error);
+      return this.createTradeExecution(
+        tradeId,
+        params,
+        latency,
+        "failed",
+        undefined,
+        undefined,
+        error instanceof Error ? error.message : String(error),
+      );
+    }
+  }
+
+  /**
+   * Cancel an order via CLOB API
    */
   private async cancelOrder(orderId: string): Promise<void> {
     try {
       logDebug(`Canceling order: ${orderId}`);
-      // TODO: Implement actual order cancellation
-      const cancelFn = this.pendingOrders.get(orderId);
-      if (cancelFn) {
-        await cancelFn.cancel();
-        this.pendingOrders.delete(orderId);
+      const success = await this.clobClient.cancelOrder(orderId);
+      if (success) {
+        logInfo(`Order ${orderId} canceled successfully`);
+      } else {
+        logWarn(`Failed to cancel order ${orderId}`);
       }
+      this.pendingOrders.delete(orderId);
     } catch (error) {
       logError(`Failed to cancel order ${orderId}:`, error);
     }
