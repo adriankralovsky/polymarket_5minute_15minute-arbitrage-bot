@@ -60,6 +60,12 @@ export class ArbitrageOrchestrator {
     // Connect to database
     await this.database.connect();
 
+    // Ensure wallet approval before starting
+    if (this.config.enableTrading) {
+      logInfo("Ensuring wallet approval...");
+      await this.executor.ensureApproved();
+    }
+
     // Connect WebSocket
     this.marketDataManager.connectWebSocket();
 
@@ -101,9 +107,16 @@ export class ArbitrageOrchestrator {
   /**
    * Initialize current markets
    */
+  private currentWindow5m: number = 0;
+  private currentWindow15m: number = 0;
+
   private async initializeMarkets(): Promise<void> {
     const window5m = this.client.getCurrent5mWindowTs();
     const window15m = this.client.getAligned15mWindow(window5m);
+
+    // Store current windows
+    this.currentWindow5m = window5m;
+    this.currentWindow15m = window15m;
 
     logInfo(`Initializing markets: 5m=${window5m}, 15m=${window15m}`);
 
@@ -127,6 +140,29 @@ export class ArbitrageOrchestrator {
   }
 
   /**
+   * Check if markets need to be switched (window rollover)
+   * Returns true if new markets should be initialized
+   */
+  private shouldSwitchMarkets(): boolean {
+    const currentWindow5m = this.client.getCurrent5mWindowTs();
+    const currentWindow15m = this.client.getAligned15mWindow(currentWindow5m);
+
+    // Check if 5m window changed
+    if (currentWindow5m !== this.currentWindow5m) {
+      logInfo(`5m window rollover detected: ${this.currentWindow5m} → ${currentWindow5m}`);
+      return true;
+    }
+
+    // Check if 15m window changed
+    if (currentWindow15m !== this.currentWindow15m) {
+      logInfo(`15m window rollover detected: ${this.currentWindow15m} → ${currentWindow15m}`);
+      return true;
+    }
+
+    return false;
+  }
+
+  /**
    * Main monitoring loop
    */
   private async monitoringLoop(): Promise<void> {
@@ -136,6 +172,25 @@ export class ArbitrageOrchestrator {
       if (currentDate !== this.lastTradeDate) {
         this.dailyTradeCount = 0;
         this.lastTradeDate = currentDate;
+      }
+
+      // Check if markets need to be switched (window rollover)
+      // This ensures we're always targeting CURRENT markets, not old ones
+      if (this.shouldSwitchMarkets()) {
+        logInfo("Window rollover detected, switching to current markets");
+        
+        // Unsubscribe from old markets
+        const oldMarkets5m = this.marketDataManager.getMarketsByType("5m");
+        const oldMarkets15m = this.marketDataManager.getMarketsByType("15m");
+        
+        for (const market of [...oldMarkets5m, ...oldMarkets15m]) {
+          const assetIds = [market.tokens.upTokenId, market.tokens.downTokenId];
+          this.marketDataManager.unsubscribeFromMarket(market.marketId);
+          logInfo(`Unsubscribed from old market ${market.marketId} (assets: ${assetIds.join(", ")})`);
+        }
+        
+        // Initialize new current markets
+        await this.initializeMarkets();
       }
 
       // Check for synchronized markets
@@ -182,7 +237,7 @@ export class ArbitrageOrchestrator {
    * Handle synchronized market detection
    */
   private async handleSyncDetected(market5m: MarketData, market15m: MarketData): Promise<void> {
-    logInfo(`Synchronized markets detected: endTime=${market5m.endTime}`);
+    //logInfo(`Synchronized markets detected: endTime=${market5m.endTime}`);
     await this.processSynchronizedMarkets(market5m, market15m);
   }
 
