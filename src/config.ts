@@ -32,6 +32,8 @@ export interface Config {
   maxDataAgeMs: number;
   // Cancel orders near endTime
   cancelBeforeEndTimeMs: number;
+  // Polygon RPC URL
+  polygonRpcUrl: string;
 }
 
 const defaultConfig: Config = {
@@ -52,6 +54,7 @@ const defaultConfig: Config = {
   defaultQuantity: parseFloat(process.env.DEFAULT_QUANTITY || "10"),
   maxDataAgeMs: parseInt(process.env.MAX_DATA_AGE_MS || "5000"),
   cancelBeforeEndTimeMs: parseInt(process.env.CANCEL_BEFORE_END_TIME_MS || "10000"),
+  polygonRpcUrl: process.env.POLY_RPC_URL || "https://polygon-rpc.com",
 };
 
 export function getConfig(): Config {
