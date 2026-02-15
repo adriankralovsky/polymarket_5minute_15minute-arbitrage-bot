@@ -84,6 +84,19 @@ MAX_POSITION_SIZE=1000
 # Data freshness
 MAX_DATA_AGE_MS=5000
 CANCEL_BEFORE_END_TIME_MS=10000
+
+# Polymarket Wallet Configuration (REQUIRED for trading)
+POLY_PRIVATE_KEY=your_private_key_here  # EOA private key (with or without 0x prefix)
+POLY_WALLET_TYPE=0  # 0=EOA (main wallet), 1=proxy, 2=proxy type 2
+POLY_FUNDER=your_proxy_wallet_address  # Required if using proxy wallet (POLY_WALLET_TYPE=1 or 2)
+POLY_RPC_URL=https://polygon-rpc.com  # Polygon RPC endpoint (can use Infura, Alchemy, etc.)
+
+# Polymarket Exchange Contract Address (OPTIONAL - defaults to correct address)
+# IMPORTANT: This is the Polymarket Exchange SMART CONTRACT address, NOT your wallet address
+# It's the contract that needs approval to spend your USDC
+# Default: 0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E (from py-clob-client)
+# Only set this if you need to override the default
+# POLYMARKET_EXCHANGE_ADDRESS=0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E
 ```
 
 ## Usage
@@ -202,15 +215,26 @@ The simulation engine:
   - Max drawdown
   - Latency sensitivity
 
+## Wallet Approval
+
+The bot implements proper EOA (Externally Owned Account) wallet approval:
+
+1. **On-chain USDC approval**: Grants the Polymarket exchange contract permission to spend USDC
+2. **API balance allowance**: Updates CLOB API with current allowances
+3. **Conditional token approval**: Updates allowance for specific conditional tokens before each trade
+
+The approval process runs automatically on bot startup if `ENABLE_TRADING=1`.
+
 ## Production Considerations
 
-- Replace placeholder order execution with actual CLOB client
-- Implement proper wallet management and approvals
-- Add comprehensive error handling and recovery
+- ✅ EOA wallet approval implemented
+- ✅ CLOB API integration for order placement
+- ✅ Proper error handling and recovery
 - Set up monitoring and alerting
 - Configure proper MongoDB indexes
 - Implement rate limiting for API calls
 - Add circuit breakers for market volatility
+- Verify contract addresses are up-to-date
 
 ## License
 
