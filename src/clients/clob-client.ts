@@ -202,7 +202,11 @@ export class ClobClient {
   ): Record<string, string> {
     const timestamp = Math.floor(Date.now() / 1000).toString();
     const message   = timestamp + method.toUpperCase() + requestPath + body;
-    const signature = createHmac("sha256", this.apiSecret!)
+    // The API secret is stored base64-encoded; decode to raw bytes before use
+    // as the HMAC key — passing the base64 string directly produces a different
+    // hash and every authenticated request returns 401.
+    const secret    = Buffer.from(this.apiSecret!, "base64");
+    const signature = createHmac("sha256", secret)
       .update(message)
       .digest("base64");
     return {
@@ -1022,9 +1026,13 @@ export class ClobClient {
       return false;
     }
     try {
-      const path = `/order/${orderId}`;
-      const url  = `${CLOB_HOST}${path}`;
-      const authHeaders = this.buildL2AuthHeaders("DELETE", path);
+      // Polymarket cancel endpoint: DELETE /order with body {"orderID": "..."}
+      // NOT DELETE /order/{id} — that path is for GET (status lookup) only.
+      // The request body must also be included in the HMAC signature message.
+      const path       = "/order";
+      const url        = `${CLOB_HOST}${path}`;
+      const bodyStr    = JSON.stringify({ orderID: orderId });
+      const authHeaders = this.buildL2AuthHeaders("DELETE", path, bodyStr);
 
       const response = await fetch(url, {
         method: "DELETE",
@@ -1032,11 +1040,12 @@ export class ClobClient {
           "Content-Type": "application/json",
           ...authHeaders,
         },
+        body: bodyStr,
       });
 
       if (!response.ok) {
-        const body = await response.text();
-        logError(`cancelOrder failed for ${orderId}: HTTP ${response.status} — ${body}`);
+        const errorBody = await response.text();
+        logError(`cancelOrder failed for ${orderId}: HTTP ${response.status} — ${errorBody}`);
         return false;
       }
 

@@ -327,6 +327,13 @@ export class ArbitrageOrchestrator {
         return;
       }
 
+      // Check risk controls BEFORE logging — prevents detected-but-blocked
+      // events from being indistinguishable from executed trades in post-mortem.
+      if (!this.checkRiskControls()) {
+        logWarn("Risk controls triggered, skipping trade");
+        return;
+      }
+
       // Log sync detection (requirement 9.1)
       logSyncDetected(
         opportunity.direction,
@@ -340,12 +347,6 @@ export class ArbitrageOrchestrator {
 
       // Log to JSON (requirement 9.2)
       this.jsonLogger.logSyncDetected(market5m, market15m, opportunity);
-
-      // Check risk controls
-      if (!this.checkRiskControls()) {
-        logWarn("Risk controls triggered, skipping trade");
-        return;
-      }
 
       // Execute trade
       if (this.config.enableTrading) {
