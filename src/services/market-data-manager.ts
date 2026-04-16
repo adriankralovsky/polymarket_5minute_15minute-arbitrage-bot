@@ -4,7 +4,7 @@
  */
 
 import WebSocket from "ws";
-import type { MarketData, PriceSnapshot, MarketType } from "../types";
+import type { MarketData, PriceSnapshot, MarketType, BeatPrice } from "../types";
 import { PolymarketClient } from "../clients/polymarket";
 import { logInfo, logError, logDebug, logWarn } from "../utils/logger";
 import { getConfig } from "../config";
@@ -509,19 +509,19 @@ export class MarketDataManager {
       return null;
     }
 
-    // Extract beat price directly from the Gamma API market data.
-    // lowerBound is Polymarket's authoritative Chainlink strike price — reading
-    // it here avoids any external oracle call and drift of up to $200.
-    // If the field is absent the market cannot be traded safely: abort tracking.
-    const beatPriceValue = this.client.getBeatPriceFromEvent(event);
-    if (beatPriceValue === null) {
+    // Extract beat price using multi-source fallback.
+    // Polymarket only populates eventMetadata.priceToBeat AFTER a market resolves,
+    // so active markets need a fallback: previous window's finalPrice or Binance.
+    const beatPriceResult = await this.client.getBeatPriceWithFallbacks(event, marketType, windowTs);
+    if (beatPriceResult === null) {
       logError(
-        `❌ No beat price found in Gamma API data for ${marketType} market (slug: ${event.slug}). ` +
-        `Aborting — cannot trade without authoritative strike price.`,
+        `❌ All beat price sources failed for ${marketType} market (slug: ${event.slug}). ` +
+        `Aborting — cannot trade without strike price.`,
       );
       return null;
     }
-    logInfo(`✅ Beat price for ${marketType} market: $${beatPriceValue.toFixed(2)} (Gamma API lowerBound)`);
+    const beatPriceValue = beatPriceResult.value;
+    const beatPriceSource = beatPriceResult.source;
 
     // Derive start/end timestamps for the MarketData record.
     const startTimestamp = this.client.getMarketStartTimestamp(event);
@@ -558,7 +558,7 @@ export class MarketDataManager {
       beatPrice: {
         value: beatPriceValue,
         timestamp: startTimestamp || startTime,
-        source: "gamma-api",
+        source: beatPriceSource as BeatPrice["source"],
       },
       tokens,
       upPrice,

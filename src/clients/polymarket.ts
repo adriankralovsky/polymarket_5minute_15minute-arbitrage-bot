@@ -3,11 +3,12 @@
  */
 
 import { retry } from "../utils/retry";
-import { logError, logDebug, logWarn } from "../utils/logger";
+import { logError, logDebug, logWarn, logInfo } from "../utils/logger";
 
 const GAMMA_EVENTS_URL = "https://gamma-api.polymarket.com/events";
 const CLOB_PRICE_URL = "https://clob.polymarket.com/price";
 const CLOB_BOOK_URL = "https://clob.polymarket.com/book";
+const BINANCE_PRICE_URL = "https://api.binance.com/api/v3/ticker/price";
 
 const BTC_5M_SLUG_PREFIX = "btc-updown-5m-";
 const BTC_15M_SLUG_PREFIX = "btc-updown-15m-";
@@ -41,9 +42,12 @@ export interface GammaEvent {
   creationDate?: string;
   active?: boolean;
   closed?: boolean;
+  /** Polymarket event-level metadata — contains priceToBeat and finalPrice (only on closed/resolved markets) */
+  eventMetadata?: { priceToBeat?: number | string; finalPrice?: number | string; [k: string]: unknown };
   markets: Array<GammaMarket & {
     eventStartTime?: string;
     startDate?: string;
+    eventMetadata?: { priceToBeat?: number | string; [k: string]: unknown };
   }>;
   [k: string]: unknown;
 }
@@ -288,24 +292,31 @@ export class PolymarketClient {
   /**
    * Extract the Chainlink beat price from a Gamma API market object.
    *
-   * Polymarket stores the Chainlink BTC/USD strike price as `lowerBound` on the
-   * market. This is the authoritative settlement value. We must NOT substitute an
-   * external oracle (CoinGecko, Chainlink Data Streams) — those can diverge by
-   * $50–200 from the value Polymarket actually uses to settle the contract.
+   * Polymarket stores the Chainlink BTC/USD strike price in one of several locations
+   * depending on when the event was created. Fields tried in order:
+   *   1. market.eventMetadata.priceToBeat  (current format as of 2026)
+   *   2. lowerBound → upperBound → xAxisValue  (legacy fields)
    *
-   * Fields tried in order: lowerBound → upperBound → xAxisValue.
-   * Any value outside [1 000, 10 000 000] is rejected as implausible for BTC/USD.
+   * Any value outside [10 000, 10 000 000] is rejected as implausible for BTC/USD.
    */
-  private extractBeatPrice(market: GammaMarket): number | null {
+  private extractBeatPrice(market: GammaMarket & { eventMetadata?: { priceToBeat?: number | string } }): number | null {
+    // 1. Check market-level eventMetadata.priceToBeat (current API format)
+    const metaRaw = market.eventMetadata?.priceToBeat;
+    if (metaRaw !== undefined && metaRaw !== null) {
+      const metaValue = typeof metaRaw === "string" ? parseFloat(metaRaw) : (metaRaw as number);
+      if (!isNaN(metaValue) && metaValue >= 10_000 && metaValue <= 10_000_000) {
+        logDebug(`Beat price from eventMetadata.priceToBeat: $${metaValue} (market: ${market.slug})`);
+        return metaValue;
+      }
+    }
+
+    // 2. Legacy fields: lowerBound → upperBound → xAxisValue
     const fields = ["lowerBound", "upperBound", "xAxisValue"] as const;
     for (const field of fields) {
       const raw = market[field];
       if (raw === undefined || raw === null) continue;
       const value = typeof raw === "string" ? parseFloat(raw) : (raw as number);
       if (isNaN(value)) continue;
-      // BTC/USD lower bound: $10,000 avoids false positives from integer fields
-      // (IDs, basis points, percentages) that are numerically below any real BTC price.
-      // Upper bound: $10,000,000 gives a ~119x headroom above current spot.
       if (value < 10_000 || value > 10_000_000) {
         logWarn(
           `Beat price candidate ${value} from field "${field}" on market ${market.slug} ` +
@@ -323,17 +334,29 @@ export class PolymarketClient {
   /**
    * Get beat price from a Gamma API event.
    *
-   * Searches all sub-markets for the first one that carries a valid `lowerBound`
-   * (or fallback field). 15m events may have multiple sub-market entries and the
-   * strike price is not guaranteed to be on index 0.
+   * Lookup order (most to least authoritative):
+   *   1. event.eventMetadata.priceToBeat  — top-level event field (current API)
+   *   2. Per-sub-market extractBeatPrice() — checks market.eventMetadata.priceToBeat
+   *      then legacy lowerBound / upperBound / xAxisValue fields.
    *
    * No external HTTP calls are made — the Gamma API data already contains the
    * authoritative Chainlink price that Polymarket uses for settlement.
    *
-   * Returns null if no market carries a plausible beat price; callers must treat
+   * Returns null if no field carries a plausible beat price; callers must treat
    * null as a hard abort — tracking cannot proceed without an accurate strike price.
    */
   getBeatPriceFromEvent(event: GammaEvent): number | null {
+    // 1. Check top-level event eventMetadata.priceToBeat (current API format)
+    const topMetaRaw = event.eventMetadata?.priceToBeat;
+    if (topMetaRaw !== undefined && topMetaRaw !== null) {
+      const topMetaValue = typeof topMetaRaw === "string" ? parseFloat(topMetaRaw) : (topMetaRaw as number);
+      if (!isNaN(topMetaValue) && topMetaValue >= 10_000 && topMetaValue <= 10_000_000) {
+        logDebug(`Beat price from event.eventMetadata.priceToBeat: $${topMetaValue} (event: ${event.slug})`);
+        return topMetaValue;
+      }
+    }
+
+    // 2. Fall back to per-sub-market search
     const markets = event.markets ?? [];
     if (markets.length === 0) {
       logWarn(`No markets found in Gamma API event ${event.slug} — cannot extract beat price`);
@@ -344,6 +367,167 @@ export class PolymarketClient {
       if (value !== null) return value;
     }
     logWarn(`No valid beat price found in any sub-market of event ${event.slug}`);
+    return null;
+  }
+
+  /**
+   * Fetch live BTC/USD price from Binance as a fallback.
+   *
+   * Used when Gamma API eventMetadata is not yet populated (active markets).
+   * Binance BTCUSDT is highly liquid and typically within $50-100 of the
+   * Chainlink BTC/USD feed that Polymarket uses for settlement.
+   *
+   * For the arbitrage bot this is acceptable: what matters is the *relative*
+   * difference between 5m and 15m beat prices, not the absolute accuracy.
+   * Both markets' fallback prices come from the same source at the same time,
+   * so any bias cancels out.
+   */
+  async fetchBtcUsdFromBinance(): Promise<number | null> {
+    const url = `${BINANCE_PRICE_URL}?symbol=BTCUSDT`;
+    try {
+      const response = await fetch(url, {
+        headers: { "User-Agent": "BTC5-15ArbBot/1.0" },
+        signal: AbortSignal.timeout(5000), // 5 second timeout
+      });
+      if (!response.ok) {
+        logWarn(`Binance API returned HTTP ${response.status}`);
+        return null;
+      }
+      const data = await response.json() as { symbol?: string; price?: string };
+      if (data.price) {
+        const price = parseFloat(data.price);
+        if (!isNaN(price) && price >= 10_000 && price <= 10_000_000) {
+          return price;
+        }
+      }
+      logWarn(`Binance API returned unexpected data: ${JSON.stringify(data)}`);
+      return null;
+    } catch (error) {
+      logError("Failed to fetch BTC price from Binance:", error);
+      return null;
+    }
+  }
+
+  /**
+   * Try to get beat price from the PREVIOUS window's resolved event.
+   *
+   * Polymarket populates `eventMetadata.finalPrice` on closed markets — this is
+   * the Chainlink BTC/USD price at the END of that window, which equals the
+   * START price (i.e. priceToBeat) of the CURRENT window.
+   *
+   * @param marketType "5m" or "15m"
+   * @param currentWindowTs The current window's start timestamp
+   * @returns The previous window's finalPrice, or null if unavailable
+   */
+  async getBeatPriceFromPreviousWindow(
+    marketType: "5m" | "15m",
+    currentWindowTs: number,
+  ): Promise<{ value: number; source: string } | null> {
+    const windowSeconds = marketType === "5m" ? 5 * 60 : 15 * 60;
+    const prevWindowTs = currentWindowTs - windowSeconds;
+    const prefix = marketType === "5m" ? BTC_5M_SLUG_PREFIX : BTC_15M_SLUG_PREFIX;
+    const slug = `${prefix}${prevWindowTs}`;
+    const url = `${GAMMA_EVENTS_URL}?slug=${encodeURIComponent(slug)}`;
+
+    try {
+      const data = await this.fetchJson<GammaEvent[]>(url);
+      if (!Array.isArray(data) || data.length === 0) {
+        logDebug(`Previous ${marketType} window event not found (slug: ${slug})`);
+        return null;
+      }
+      const prevEvent = data[0];
+
+      // Check finalPrice on the previous (now-resolved) event
+      const finalRaw = prevEvent.eventMetadata?.finalPrice;
+      if (finalRaw !== undefined && finalRaw !== null) {
+        const finalValue = typeof finalRaw === "string" ? parseFloat(finalRaw) : (finalRaw as number);
+        if (!isNaN(finalValue) && finalValue >= 10_000 && finalValue <= 10_000_000) {
+          logDebug(
+            `Beat price from previous ${marketType} window finalPrice: $${finalValue} ` +
+            `(prev slug: ${slug})`,
+          );
+          return { value: finalValue, source: "gamma-api-prev-finalPrice" };
+        }
+      }
+
+      // Also try priceToBeat on the previous event as a secondary check
+      const ptbRaw = prevEvent.eventMetadata?.priceToBeat;
+      if (ptbRaw !== undefined && ptbRaw !== null) {
+        // The previous window's priceToBeat is NOT the current window's beat price,
+        // but we log it for debugging context.
+        logDebug(
+          `Previous ${marketType} window has priceToBeat but not finalPrice (slug: ${slug})`,
+        );
+      }
+
+      return null;
+    } catch (error) {
+      logDebug(`Failed to fetch previous ${marketType} window event: ${error}`);
+      return null;
+    }
+  }
+
+  /**
+   * Get beat price with multi-source fallback.
+   *
+   * Polymarket only populates `eventMetadata.priceToBeat` AFTER a market resolves.
+   * Active markets have no eventMetadata at all. This method implements a 3-tier
+   * fallback to ensure the bot can always obtain a beat price:
+   *
+   *   1. Gamma API `eventMetadata.priceToBeat` — authoritative Chainlink price
+   *      (only available on closed/resolved markets)
+   *   2. Previous window's `eventMetadata.finalPrice` — the Chainlink price at
+   *      the end of the prior window = start of the current window
+   *   3. Live Binance BTC/USDT — immediate fallback, typically within $50-100
+   *      of the Chainlink feed
+   *
+   * @returns { value, source } or null if all sources fail
+   */
+  async getBeatPriceWithFallbacks(
+    event: GammaEvent,
+    marketType: "5m" | "15m",
+    windowTs: number,
+  ): Promise<{ value: number; source: string } | null> {
+    // 1. Try Gamma API eventMetadata.priceToBeat (only on closed markets)
+    const gammaPrice = this.getBeatPriceFromEvent(event);
+    if (gammaPrice !== null) {
+      logInfo(
+        `✅ Beat price for ${marketType} from Gamma API: $${gammaPrice.toFixed(2)} (event: ${event.slug})`,
+      );
+      return { value: gammaPrice, source: "gamma-api" };
+    }
+
+    // 2. Try previous window's finalPrice (Chainlink price at previous window's end = current start)
+    logDebug(
+      `${marketType} market ${event.slug} has no eventMetadata.priceToBeat (market is active/unresolved). ` +
+      `Trying previous window...`,
+    );
+    const prevPrice = await this.getBeatPriceFromPreviousWindow(marketType, windowTs);
+    if (prevPrice !== null) {
+      logInfo(
+        `✅ Beat price for ${marketType} from previous window finalPrice: $${prevPrice.value.toFixed(2)} ` +
+        `(event: ${event.slug})`,
+      );
+      return prevPrice;
+    }
+
+    // 3. Last resort: live Binance BTC/USDT
+    logDebug(
+      `${marketType} previous window also unavailable. Falling back to Binance BTC/USDT...`,
+    );
+    const binancePrice = await this.fetchBtcUsdFromBinance();
+    if (binancePrice !== null) {
+      logInfo(
+        `✅ Beat price for ${marketType} from Binance fallback: $${binancePrice.toFixed(2)} ` +
+        `(event: ${event.slug}) ⚠️ May diverge from Chainlink by $50-200`,
+      );
+      return { value: binancePrice, source: "binance-fallback" };
+    }
+
+    logError(
+      `❌ All beat price sources failed for ${marketType} market (event: ${event.slug}). ` +
+      `Cannot trade without strike price.`,
+    );
     return null;
   }
 
