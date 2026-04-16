@@ -532,6 +532,55 @@ export class PolymarketClient {
   }
 
   /**
+   * Fetch the final settlement BTC/USD price for a market that has just resolved.
+   *
+   * Polymarket populates `eventMetadata.finalPrice` on the Gamma API event once
+   * the Chainlink oracle has settled — this is the authoritative price used for
+   * UP/DOWN resolution. The slug is reconstructed from the market's endTime,
+   * which equals the start timestamp of the NEXT window.
+   *
+   * Tries both the 5m and 15m slugs (either could match depending on which market
+   * type we're resolving). Falls back to the live Binance price if the oracle
+   * hasn't propagated yet (typically within ~60 seconds of market close).
+   *
+   * @param endTimeUnix Unix timestamp (seconds) of the market's endTime
+   * @returns Final BTC/USD price, or null if unavailable
+   */
+  async getFinalBtcPrice(endTimeUnix: number): Promise<number | null> {
+    // The endTime of the current window = startTs of the next window = the slug
+    // used by Polymarket for the next event. But we want the CURRENT event which
+    // has this endTime. Its slug is startTs = endTime - windowLength.
+    // Since we don't know the window length from here, try both 5m and 15m slugs
+    // whose end times match endTimeUnix.
+    const slug5m  = `${BTC_5M_SLUG_PREFIX}${endTimeUnix  - 5  * 60}`;
+    const slug15m = `${BTC_15M_SLUG_PREFIX}${endTimeUnix - 15 * 60}`;
+
+    for (const slug of [slug5m, slug15m]) {
+      try {
+        const url = `${GAMMA_EVENTS_URL}?slug=${encodeURIComponent(slug)}`;
+        const data = await this.fetchJson<GammaEvent[]>(url);
+        if (!Array.isArray(data) || data.length === 0) continue;
+
+        const event = data[0];
+        const finalRaw = event.eventMetadata?.finalPrice;
+        if (finalRaw !== undefined && finalRaw !== null) {
+          const finalValue = typeof finalRaw === "string" ? parseFloat(finalRaw) : (finalRaw as number);
+          if (!isNaN(finalValue) && finalValue >= 10_000 && finalValue <= 10_000_000) {
+            logInfo(`Final BTC price from Gamma API (slug: ${slug}): $${finalValue.toFixed(2)}`);
+            return finalValue;
+          }
+        }
+      } catch (error) {
+        logDebug(`Failed to fetch final price for slug ${slug}: ${error}`);
+      }
+    }
+
+    // Oracle hasn't settled yet — fall back to live Binance price.
+    logWarn(`Gamma API finalPrice not yet available for endTime ${endTimeUnix} — using Binance fallback`);
+    return this.fetchBtcUsdFromBinance();
+  }
+
+  /**
    * Get best executable price from orderbook (best ask for buying)
    */
   getBestExecutablePrice(orderbook: OrderBook | null): number | null {

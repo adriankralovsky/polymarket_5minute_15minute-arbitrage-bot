@@ -39,6 +39,9 @@ export class ArbitrageOrchestrator {
   // 5 seconds is plenty for observability; trades use their own write path.
   private readonly MARKET_DATA_WRITE_INTERVAL_MS = 5000;
   private lastMarketDataWrite: Map<string, number> = new Map();
+  // Track markets that have already had finalResolution written so we don't
+  // poll Polymarket repeatedly for a result we already have.
+  private resolvedMarkets: Set<string> = new Set();
 
   constructor() {
     this.client = new PolymarketClient();
@@ -255,9 +258,107 @@ export class ArbitrageOrchestrator {
             logError(`Pre-expiry order cancel failed for market ${market.marketId}:`, error);
           });
         }
+
+        // Resolve market after endTime (fetch finalFinishPrice and write to log)
+        if (timeToEnd <= 0 && !this.resolvedMarkets.has(market.marketId)) {
+          // Fire-and-forget; errors are logged inside resolveMarket.
+          this.resolveMarket(market).catch((error) => {
+            logError(`Failed to resolve market ${market.marketId}:`, error);
+          });
+        }
       }
     } catch (error) {
       logError("Error in monitoring loop:", error);
+    }
+  }
+
+  /**
+   * Fetch the final resolution for a market after its endTime and write it
+   * to the JSON log so the simulator can score trades accurately.
+   */
+  private async resolveMarket(market: MarketData): Promise<void> {
+    // Mark immediately to prevent duplicate concurrent resolve calls.
+    this.resolvedMarkets.add(market.marketId);
+
+    // Give Polymarket's oracle a few seconds to settle after endTime.
+    const msSinceEnd = Date.now() - market.endTime * 1000;
+    if (msSinceEnd < 5000) {
+      await new Promise((r) => setTimeout(r, 5000 - msSinceEnd));
+    }
+
+    logInfo(`Fetching final resolution for market ${market.marketId} (${market.marketType})...`);
+
+    try {
+      const finalFinishPrice = await this.client.getFinalBtcPrice(market.endTime);
+      if (finalFinishPrice === null) {
+        logWarn(`Could not fetch final BTC price for market ${market.marketId} — will retry next tick`);
+        this.resolvedMarkets.delete(market.marketId); // allow retry
+        return;
+      }
+
+      // Determine result for this individual market based on whether BTC
+      // finished above or below the beat price.
+      const beatPrice = market.beatPrice?.value ?? 0;
+      const result: "UP" | "DOWN" = finalFinishPrice > beatPrice ? "UP" : "DOWN";
+
+      // Update in-memory market state
+      market.finalFinishPrice = finalFinishPrice;
+      market.result = result;
+
+      logInfo(
+        `Market ${market.marketId} (${market.marketType}) resolved: ` +
+        `BTC=${finalFinishPrice} beat=${beatPrice} → ${result}`,
+      );
+
+      // Find the paired market so we can write both results to the JSON log.
+      const otherType: "5m" | "15m" = market.marketType === "5m" ? "15m" : "5m";
+      const pairedMarket = this.marketDataManager.getMarketsByType(otherType)
+        .find((m) => m.endTime === market.endTime);
+
+      if (pairedMarket) {
+        // Also resolve the paired market if not done yet.
+        if (pairedMarket.result === "PENDING") {
+          const pairedResult: "UP" | "DOWN" = finalFinishPrice > (pairedMarket.beatPrice?.value ?? 0) ? "UP" : "DOWN";
+          pairedMarket.finalFinishPrice = finalFinishPrice;
+          pairedMarket.result = pairedResult;
+          this.resolvedMarkets.add(pairedMarket.marketId);
+          logInfo(
+            `Market ${pairedMarket.marketId} (${pairedMarket.marketType}) resolved: ` +
+            `BTC=${finalFinishPrice} beat=${pairedMarket.beatPrice?.value ?? 0} → ${pairedResult}`,
+          );
+        }
+
+        const market5m  = market.marketType === "5m" ? market : pairedMarket;
+        const market15m = market.marketType === "15m" ? market : pairedMarket;
+
+        // Write finalResolution to the JSON log file.
+        this.jsonLogger.logFinalResolution(
+          market5m,
+          market15m,
+          finalFinishPrice,
+          market5m.result as "UP" | "DOWN",
+          market15m.result as "UP" | "DOWN",
+        );
+
+        logInfo(
+          `JSON log updated with finalResolution: 5m=${market5m.result} 15m=${market15m.result} ` +
+          `finishPrice=${finalFinishPrice}`,
+        );
+      } else {
+        logWarn(
+          `Could not find paired ${otherType} market for resolution logging ` +
+          `(market ${market.marketId}, endTime ${market.endTime})`,
+        );
+      }
+
+      // Persist resolution to database.
+      await this.storeMarketData(market);
+      if (pairedMarket) await this.storeMarketData(pairedMarket);
+
+    } catch (error) {
+      logError(`Error resolving market ${market.marketId}:`, error);
+      // Allow retry on next monitoring tick.
+      this.resolvedMarkets.delete(market.marketId);
     }
   }
 
