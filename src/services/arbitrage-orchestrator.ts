@@ -203,10 +203,24 @@ export class ArbitrageOrchestrator {
         } else {
           logInfo("Window rollover detected, switching to current markets");
 
-          // Unsubscribe from old markets
           const oldMarkets5m = this.marketDataManager.getMarketsByType("5m");
           const oldMarkets15m = this.marketDataManager.getMarketsByType("15m");
 
+          // ── Resolve BEFORE unsubscribing ──────────────────────────────────
+          // unsubscribeFromMarket() removes the market from the cache. If we
+          // unsubscribe first, the post-rollover loop finds no old markets and
+          // resolveMarket() never fires. Capture references and kick off
+          // resolution while they are still accessible.
+          for (const market of [...oldMarkets5m, ...oldMarkets15m]) {
+            if (!this.resolvedMarkets.has(market.marketId)) {
+              logInfo(`Triggering resolution for expiring market ${market.marketId} (${market.marketType})`);
+              this.resolveMarket(market).catch((error) => {
+                logError(`Failed to resolve market ${market.marketId} during rollover:`, error);
+              });
+            }
+          }
+
+          // Unsubscribe from old markets (removes them from cache)
           for (const market of [...oldMarkets5m, ...oldMarkets15m]) {
             const assetIds = [market.tokens.upTokenId, market.tokens.downTokenId];
             this.marketDataManager.unsubscribeFromMarket(market.marketId);
@@ -234,15 +248,24 @@ export class ArbitrageOrchestrator {
       ];
 
       for (const market of allMarkets) {
+        // Stale data detection: in paper-trade mode (or thin markets) the
+        // orderbook can be genuinely unchanged for 30+ seconds — that's not
+        // an error, just a quiet market. Log at DEBUG to avoid log noise.
         if (this.marketDataManager.isDataStale(market)) {
-          logWarn(`Stale data detected for market ${market.marketId}`);
+          if (this.config.enableTrading) {
+            logWarn(`Stale data detected for market ${market.marketId}`);
+          } else {
+            logDebug(`Quiet market (no WS update) for ${market.marketId} — expected in paper mode`);
+          }
         }
 
-        // Cancel open orders near endTime (requirement 11).
-        // Fire once per market per window — the Set guard prevents the 1-second
-        // loop from hammering the CLOB API with redundant cancel requests.
         const timeToEnd = market.endTime * 1000 - Date.now();
+
+        // Cancel open orders near endTime.
+        // Skip entirely in paper-trade mode — there are no real orders to cancel
+        // and the CLOB returns HTTP 405 for unauthenticated cancel requests.
         if (
+          this.config.enableTrading &&
           timeToEnd < this.config.cancelBeforeEndTimeMs &&
           timeToEnd > 0 &&
           !this.cancelledMarketsBeforeExpiry.has(market.marketId)
@@ -253,15 +276,16 @@ export class ArbitrageOrchestrator {
             `Market ${market.marketId} ending in ${Math.round(timeToEnd / 1000)}s — ` +
             `canceling all open orders to avoid post-resolution fills`,
           );
-          // Fire-and-forget: cancellation is best-effort; errors are logged inside.
           this.executor.cancelOrdersForTokens(tokenIds).catch((error) => {
             logError(`Pre-expiry order cancel failed for market ${market.marketId}:`, error);
           });
         }
 
-        // Resolve market after endTime (fetch finalFinishPrice and write to log)
+        // Resolve market after endTime (fetch finalFinishPrice and write to log).
+        // Also handled at rollover time; this catches the edge case where the
+        // market expires without a rollover firing first (e.g. bot started
+        // mid-window and shouldSwitchMarkets never returned true for this window).
         if (timeToEnd <= 0 && !this.resolvedMarkets.has(market.marketId)) {
-          // Fire-and-forget; errors are logged inside resolveMarket.
           this.resolveMarket(market).catch((error) => {
             logError(`Failed to resolve market ${market.marketId}:`, error);
           });
