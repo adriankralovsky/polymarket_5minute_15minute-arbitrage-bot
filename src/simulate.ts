@@ -54,20 +54,7 @@ async function main(): Promise<void> {
           startTime: log.startTime,
           endTime: log.endTime,
           beatPrice: log.beatPrices.beat5m,
-          priceTimeline: log.tradeAttempts
-            .filter((a) => a.opportunity.prices !== null)
-            .map((a) => {
-              const dir = a.opportunity.direction;
-              const prices = a.opportunity.prices!;
-              // If 5m is the upMarket, it holds the upPrice; otherwise downPrice
-              const is5mUp = dir?.upMarket === "5m";
-              return {
-                timestamp: a.timestamp,
-                upPrice: is5mUp ? prices.upPrice : prices.downPrice,
-                downPrice: is5mUp ? prices.downPrice : prices.upPrice,
-                source: "rest" as const,
-              };
-            }),
+          priceTimeline: log.priceTimeline?.market5m ?? [],
           finalFinishPrice: log.finalResolution?.finishPrice || 0,
           result: log.finalResolution?.result5m || "PENDING",
         },
@@ -77,20 +64,7 @@ async function main(): Promise<void> {
           startTime: log.startTime,
           endTime: log.endTime,
           beatPrice: log.beatPrices.beat15m,
-          priceTimeline: log.tradeAttempts
-            .filter((a) => a.opportunity.prices !== null)
-            .map((a) => {
-              const dir = a.opportunity.direction;
-              const prices = a.opportunity.prices!;
-              // If 15m is the upMarket, it holds the upPrice; otherwise downPrice
-              const is15mUp = dir?.upMarket === "15m";
-              return {
-                timestamp: a.timestamp,
-                upPrice: is15mUp ? prices.upPrice : prices.downPrice,
-                downPrice: is15mUp ? prices.downPrice : prices.upPrice,
-                source: "rest" as const,
-              };
-            }),
+          priceTimeline: log.priceTimeline?.market15m ?? [],
           finalFinishPrice: log.finalResolution?.finishPrice || 0,
           result: log.finalResolution?.result15m || "PENDING",
         },

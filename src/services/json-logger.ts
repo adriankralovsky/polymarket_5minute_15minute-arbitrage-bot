@@ -4,7 +4,7 @@
 
 import * as fs from "fs";
 import * as path from "path";
-import type { MarketData, ArbitrageOpportunity, TradeExecution } from "../types";
+import type { MarketData, ArbitrageOpportunity, TradeExecution, PriceSnapshot } from "../types";
 import { logError, logDebug } from "../utils/logger";
 import { getConfig } from "../config";
 
@@ -25,6 +25,17 @@ interface MarketPairLog {
     opportunity: ArbitrageOpportunity;
     executed: boolean;
   }>;
+  /**
+   * Full per-market price history, independent of which side was traded.
+   * Each entry captures the actual upPrice/downPrice of that specific market
+   * at the moment of sync detection, sourced directly from the live orderbook.
+   * These are used by the SimulationEngine instead of tradeAttempts so the
+   * simulator always sees real, uncontaminated market-specific prices.
+   */
+  priceTimeline: {
+    market5m: PriceSnapshot[];
+    market15m: PriceSnapshot[];
+  };
   executionResults: TradeExecution[];
   finalResolution: {
     finishPrice: number;
@@ -76,6 +87,7 @@ export class JsonLogger {
         },
         detectedDirection: null,
         tradeAttempts: [],
+        priceTimeline: { market5m: [], market15m: [] },
         executionResults: [],
         finalResolution: null,
         realizedPnL: 0,
@@ -93,9 +105,28 @@ export class JsonLogger {
     const log = this.getOrCreateLog(market5m, market15m);
     log.detectedDirection = opportunity.direction;
 
-    // Add trade attempt
+    const now = Date.now();
+
+    // Capture the full independent price state of EACH market separately.
+    // This avoids the "lossiness" problem where only the traded leg's price was
+    // saved — the simulator needs both upPrice and downPrice for each market
+    // to replay an accurate orderbook state.
+    log.priceTimeline.market5m.push({
+      timestamp: now,
+      upPrice: market5m.upPrice,
+      downPrice: market5m.downPrice,
+      source: "websocket",
+    });
+    log.priceTimeline.market15m.push({
+      timestamp: now,
+      upPrice: market15m.upPrice,
+      downPrice: market15m.downPrice,
+      source: "websocket",
+    });
+
+    // Add trade attempt (kept for diagnostics / audit trail).
     log.tradeAttempts.push({
-      timestamp: Date.now(),
+      timestamp: now,
       opportunity,
       executed: false,
     });
