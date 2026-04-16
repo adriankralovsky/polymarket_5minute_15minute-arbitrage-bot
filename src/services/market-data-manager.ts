@@ -57,10 +57,6 @@ export class MarketDataManager {
     messageHandlers: new Map(),
   };
   private marketCache: Map<string, MarketData> = new Map();
-  // Beat price cache: key = market start time (timestamp), value = beat price
-  // Beat price is FIXED at market start time (Chainlink BTC/USD price)
-  // Once fetched, store it and reuse - only update when new market detected
-  private beatPriceCache: Map<number, number> = new Map();
   private callbacks: MarketDataCallbacks;
   private config = getConfig();
   private tableInitialized: boolean = false;
@@ -513,61 +509,30 @@ export class MarketDataManager {
       return null;
     }
 
-    // Use the same method as getBeatPriceFromEvent to get start timestamp
-    // This ensures consistency - checks all markets, not just the first one
-    // Important for 15m markets which might have multiple markets
+    // Extract beat price directly from the Gamma API market data.
+    // lowerBound is Polymarket's authoritative Chainlink strike price — reading
+    // it here avoids any external oracle call and drift of up to $200.
+    // If the field is absent the market cannot be traded safely: abort tracking.
+    const beatPriceValue = this.client.getBeatPriceFromEvent(event);
+    if (beatPriceValue === null) {
+      logError(
+        `❌ No beat price found in Gamma API data for ${marketType} market (slug: ${event.slug}). ` +
+        `Aborting — cannot trade without authoritative strike price.`,
+      );
+      return null;
+    }
+    logInfo(`✅ Beat price for ${marketType} market: $${beatPriceValue.toFixed(2)} (Gamma API lowerBound)`);
+
+    // Derive start/end timestamps for the MarketData record.
     const startTimestamp = this.client.getMarketStartTimestamp(event);
     if (!startTimestamp) {
-      logError(`❌ CRITICAL: Could not determine market start timestamp for ${marketType} market`);
-      logError(`Event slug: ${event.slug}`);
-      logError(`Event has ${event.markets?.length || 0} markets`);
-      if (event.markets && event.markets.length > 0) {
-        const firstMarket = event.markets[0];
-        logError(`First market keys: ${Object.keys(firstMarket || {}).join(", ")}`);
-        logError(`First market eventStartTime: ${(firstMarket as any)?.eventStartTime || "N/A"}`);
-        logError(`First market startDate: ${(firstMarket as any)?.startDate || "N/A"}`);
-      }
-      logError(`Event startDate: ${event.startDate || "N/A"}`);
-      logError(`Event creationDate: ${event.creationDate || "N/A"}`);
-      // Continue anyway, but beat price will be null
+      logWarn(`Could not determine start timestamp for ${marketType} market (slug: ${event.slug}) — using 0`);
     }
-    
     const startTime = startTimestamp || 0;
     // Use Math.floor so endTime is always an integer Unix timestamp.
     // A sub-second endDate (e.g. "...T12:05:00.500Z") would produce a float,
     // causing the === endTime sync-check to fail intermittently.
     const endTime = Math.floor(new Date(event.endDate).getTime() / 1000);
-
-    // Get beat price from cache or fetch it
-    // Beat price = Chainlink BTC/USD price at market start timestamp (FIXED - never changes)
-    // Cache key: market start time (timestamp) - must match the timestamp used in getBeatPriceFromEvent
-    let beatPriceValue: number | null = null;
-    
-    if (!startTimestamp) {
-      logWarn(`⚠️  Skipping beat price fetch for ${marketType} market - no start timestamp`);
-    } else {
-      const cacheKey = Math.floor(startTimestamp); // Use same timestamp as getBeatPriceFromEvent
-      
-      if (this.beatPriceCache.has(cacheKey)) {
-        // Use cached beat price (already fetched for this market start time)
-        beatPriceValue = this.beatPriceCache.get(cacheKey)!;
-        logInfo(`✅ Using cached beat price for ${marketType} market (startTime: ${cacheKey}): $${beatPriceValue.toFixed(2)}`);
-      } else {
-        // Fetch beat price from Chainlink at market start time
-        logInfo(`🔄 Fetching beat price for ${marketType} market (startTime: ${cacheKey}, slug: ${event.slug})...`);
-        beatPriceValue = await this.client.getBeatPriceFromEvent(event);
-        if (beatPriceValue === null) {
-          logError(`❌ Failed to fetch beat price for ${marketType} market`);
-          logError(`   Slug: ${event.slug}`);
-          logError(`   Start timestamp: ${cacheKey} (${new Date(cacheKey * 1000).toISOString()})`);
-          logError(`   Beat price should be Chainlink BTC/USD price at market start time`);
-        } else {
-          // Store in cache for future use (same start time = same beat price)
-          this.beatPriceCache.set(cacheKey, beatPriceValue);
-          logInfo(`✅ Fetched and cached beat price for ${marketType} market (startTime: ${cacheKey}): $${beatPriceValue.toFixed(2)}`);
-        }
-      }
-    }
 
     // NOTE: For arbitrage bot, we rely ONLY on WebSocket for real-time prices
     // Initial prices will be set to null and updated via WebSocket
@@ -582,13 +547,11 @@ export class MarketDataManager {
       slug: event.slug,
       startTime,
       endTime,
-      beatPrice: beatPriceValue
-        ? {
-            value: beatPriceValue,
-            timestamp: startTimestamp || startTime,
-            source: "polymarket", // Chainlink BTC/USD at market start time
-          }
-        : null,
+      beatPrice: {
+        value: beatPriceValue,
+        timestamp: startTimestamp || startTime,
+        source: "gamma-api",
+      },
       tokens,
       upPrice,
       downPrice,

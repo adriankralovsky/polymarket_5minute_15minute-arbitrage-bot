@@ -337,4 +337,45 @@ export class TradeExecutor {
       pnlEstimate,
     };
   }
+
+  /**
+   * Cancel all open orders whose tokenId matches one of the supplied token IDs.
+   *
+   * Called by the orchestrator's pre-expiry sweep to ensure no orders remain live
+   * when a market approaches settlement — preventing fills from toxic post-resolution
+   * flow. Returns the number of orders successfully canceled.
+   */
+  async cancelOrdersForTokens(tokenIds: string[]): Promise<number> {
+    if (tokenIds.length === 0) return 0;
+    const tokenIdSet = new Set(tokenIds);
+
+    try {
+      const openOrders = await this.clobClient.getOpenOrders();
+      const relevant = openOrders.filter((o) => tokenIdSet.has(o.tokenId));
+
+      if (relevant.length === 0) {
+        logDebug(`No open orders found for token(s): ${tokenIds.join(", ")}`);
+        return 0;
+      }
+
+      logInfo(`Canceling ${relevant.length} open order(s) for token(s): ${tokenIds.join(", ")}`);
+
+      let canceled = 0;
+      for (const order of relevant) {
+        const ok = await this.clobClient.cancelOrder(order.orderID);
+        if (ok) {
+          canceled++;
+          logDebug(`Canceled order ${order.orderID}`);
+        } else {
+          logWarn(`Failed to cancel order ${order.orderID} (token: ${order.tokenId})`);
+        }
+      }
+
+      logInfo(`Pre-expiry sweep: canceled ${canceled}/${relevant.length} order(s)`);
+      return canceled;
+    } catch (error) {
+      logError("cancelOrdersForTokens failed:", error);
+      return 0;
+    }
+  }
 }

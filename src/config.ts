@@ -62,7 +62,7 @@ const defaultConfig: Config = {
   enableTrading: process.env.ENABLE_TRADING === "1",
   defaultQuantity: parseFloat(process.env.DEFAULT_QUANTITY || "10"),
   maxDataAgeMs: parseInt(process.env.MAX_DATA_AGE_MS || "5000", 10),
-  cancelBeforeEndTimeMs: parseInt(process.env.CANCEL_BEFORE_END_TIME_MS || "10000", 10),
+  cancelBeforeEndTimeMs: parseInt(process.env.CANCEL_BEFORE_END_TIME_MS || "15000", 10),
   polygonRpcUrl: process.env.POLY_RPC_URL || "https://polygon-rpc.com",
   maxPriceVolatility: parseFloat(process.env.MAX_PRICE_VOLATILITY || "0.05"),
   // 30 snapshots ≈ 15 seconds at 2 ticks/sec — enough history for a meaningful

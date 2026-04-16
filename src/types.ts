@@ -15,7 +15,7 @@ export type MarketResult = "UP" | "DOWN" | "PENDING";
 export interface BeatPrice {
   value: number;
   timestamp: number; // Market start timestamp
-  source: "coingecko" | "polymarket" | "calculated";
+  source: "coingecko" | "polymarket" | "calculated" | "gamma-api";
 }
 
 /**

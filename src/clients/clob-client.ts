@@ -883,6 +883,44 @@ export class ClobClient {
   }
 
   /**
+   * Get all open (LIVE) orders for this wallet.
+   * Used by cancelOrdersForTokens to find orders that need pre-expiry cancellation.
+   */
+  async getOpenOrders(): Promise<Array<{ orderID: string; tokenId: string; status: string }>> {
+    try {
+      const url = `${CLOB_HOST}/orders?maker=${this.wallet.address}&status=LIVE`;
+      const response = await fetch(url);
+      if (!response.ok) {
+        logWarn(`getOpenOrders failed: HTTP ${response.status}`);
+        return [];
+      }
+      const data = (await response.json()) as Array<{
+        orderID?: string;
+        order_id?: string;
+        tokenId?: string;
+        token_id?: string;
+        asset_id?: string;
+        status?: string;
+        [key: string]: unknown;
+      }>;
+      if (!Array.isArray(data)) {
+        logWarn("getOpenOrders: unexpected response shape");
+        return [];
+      }
+      return data
+        .map((o) => ({
+          orderID:  o.orderID  ?? o.order_id  ?? "",
+          tokenId:  o.tokenId  ?? o.token_id  ?? o.asset_id ?? "",
+          status:   o.status   ?? "LIVE",
+        }))
+        .filter((o) => o.orderID !== "");
+    } catch (error) {
+      logError("Failed to get open orders:", error);
+      return [];
+    }
+  }
+
+  /**
    * Get order status
    */
   async getOrderStatus(orderId: string): Promise<ClobOrderResponse | null> {

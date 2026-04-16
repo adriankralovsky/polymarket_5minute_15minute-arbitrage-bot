@@ -27,6 +27,9 @@ export class ArbitrageOrchestrator {
   private monitoringInterval: NodeJS.Timeout | null = null;
   private dailyTradeCount = 0;
   private lastTradeDate = new Date().toDateString();
+  // Track which markets have already had their pre-expiry cancel fired this window.
+  // Prevents the 1-second monitoring loop from issuing redundant cancel requests.
+  private cancelledMarketsBeforeExpiry: Set<string> = new Set();
   // Throttle market-data DB writes: at 100+ WebSocket ticks/sec, writing on
   // every update causes thousands of queued MongoDB ops and an OOM crash.
   // 5 seconds is plenty for observability; trades use their own write path.
@@ -200,6 +203,9 @@ export class ArbitrageOrchestrator {
             logInfo(`Unsubscribed from old market ${market.marketId} (assets: ${assetIds.join(", ")})`);
           }
 
+          // Clear pre-expiry cancel tracking for the new window
+          this.cancelledMarketsBeforeExpiry.clear();
+
           // Initialize new current markets
           await this.initializeMarkets();
         }
@@ -222,11 +228,25 @@ export class ArbitrageOrchestrator {
           logWarn(`Stale data detected for market ${market.marketId}`);
         }
 
-        // Cancel orders near endTime (requirement 11)
+        // Cancel open orders near endTime (requirement 11).
+        // Fire once per market per window — the Set guard prevents the 1-second
+        // loop from hammering the CLOB API with redundant cancel requests.
         const timeToEnd = market.endTime * 1000 - Date.now();
-        if (timeToEnd < this.config.cancelBeforeEndTimeMs && timeToEnd > 0) {
-          logWarn(`Market ${market.marketId} ending soon, canceling pending orders`);
-          // TODO: Implement order cancellation
+        if (
+          timeToEnd < this.config.cancelBeforeEndTimeMs &&
+          timeToEnd > 0 &&
+          !this.cancelledMarketsBeforeExpiry.has(market.marketId)
+        ) {
+          this.cancelledMarketsBeforeExpiry.add(market.marketId);
+          const tokenIds = [market.tokens.upTokenId, market.tokens.downTokenId];
+          logWarn(
+            `Market ${market.marketId} ending in ${Math.round(timeToEnd / 1000)}s — ` +
+            `canceling all open orders to avoid post-resolution fills`,
+          );
+          // Fire-and-forget: cancellation is best-effort; errors are logged inside.
+          this.executor.cancelOrdersForTokens(tokenIds).catch((error) => {
+            logError(`Pre-expiry order cancel failed for market ${market.marketId}:`, error);
+          });
         }
       }
     } catch (error) {

@@ -3,12 +3,11 @@
  */
 
 import { retry } from "../utils/retry";
-import { logError, logInfo, logDebug, logWarn } from "../utils/logger";
+import { logError, logDebug, logWarn } from "../utils/logger";
 
 const GAMMA_EVENTS_URL = "https://gamma-api.polymarket.com/events";
 const CLOB_PRICE_URL = "https://clob.polymarket.com/price";
 const CLOB_BOOK_URL = "https://clob.polymarket.com/book";
-const COINGECKO_RANGE_URL = "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart/range";
 
 const BTC_5M_SLUG_PREFIX = "btc-updown-5m-";
 const BTC_15M_SLUG_PREFIX = "btc-updown-15m-";
@@ -287,227 +286,54 @@ export class PolymarketClient {
   }
 
   /**
-   * Get Chainlink BTC/USD price at specific timestamp
-   * Beat price = Chainlink BTC/USD price at market start time
+   * Extract the Chainlink beat price from a Gamma API market object.
+   *
+   * Polymarket stores the Chainlink BTC/USD strike price as `lowerBound` on the
+   * market. This is the authoritative settlement value. We must NOT substitute an
+   * external oracle (CoinGecko, Chainlink Data Streams) — those can diverge by
+   * $50–200 from the value Polymarket actually uses to settle the contract.
+   *
+   * Fields tried in order: lowerBound → upperBound → xAxisValue.
+   * Any value outside [1 000, 10 000 000] is rejected as implausible for BTC/USD.
    */
-  private async getChainlinkPriceAtTimestamp(timestamp: number): Promise<number | null> {
-    try {
-      // Method 1: Try Chainlink Data Streams API
-      try {
-        const streamsUrl = `https://data.chain.link/streams/btc-usd/reports?timestamp=${timestamp}`;
-        const response = await fetch(streamsUrl, {
-          headers: {
-            Accept: "application/json",
-            "User-Agent": "BTC5-15ArbBot/1.0",
-          },
-        });
-        
-        if (response.ok) {
-          const contentType = response.headers.get("content-type");
-          if (contentType && contentType.includes("application/json")) {
-            const data = await response.json() as {
-              reports?: Array<{ timestamp: string; price: number }>;
-              price?: number;
-              [key: string]: unknown;
-            };
-            
-            if (typeof data.price === "number") {
-              return data.price;
-            }
-            
-            if (Array.isArray(data.reports) && data.reports.length > 0) {
-              const targetMs = timestamp * 1000;
-              const closest = data.reports.reduce((best, current) => {
-                const bestTs = new Date(best.timestamp).getTime();
-                const currentTs = new Date(current.timestamp).getTime();
-                return Math.abs(currentTs - targetMs) < Math.abs(bestTs - targetMs) ? current : best;
-              });
-              
-              if (closest.price) {
-                return closest.price;
-              }
-            }
-          }
-        }
-      } catch (err) {
-        logDebug(`Chainlink Data Streams failed: ${err}`);
+  private extractBeatPrice(market: GammaMarket): number | null {
+    const fields = ["lowerBound", "upperBound", "xAxisValue"] as const;
+    for (const field of fields) {
+      const raw = market[field];
+      if (raw === undefined || raw === null) continue;
+      const value = typeof raw === "string" ? parseFloat(raw) : (raw as number);
+      if (isNaN(value)) continue;
+      if (value < 1_000 || value > 10_000_000) {
+        logWarn(
+          `Beat price candidate ${value} from field "${field}" on market ${market.slug} ` +
+          `is outside plausible BTC/USD range [1 000, 10 000 000] — ignoring`,
+        );
+        continue;
       }
-      
-      // Method 2: Try CoinGecko historical price (fallback for Chainlink)
-      // CoinGecko provides historical BTC prices that match Chainlink data
-      try {
-        const now = Math.floor(Date.now() / 1000);
-        const from = timestamp;
-        const to = Math.min(timestamp + 60, now); // 1 minute range
-        
-        const coingeckoUrl = `https://api.coingecko.com/api/v3/coins/bitcoin/market_chart/range?vs_currency=usd&from=${from}&to=${to}`;
-        const response = await fetch(coingeckoUrl, {
-          headers: {
-            Accept: "application/json",
-            "User-Agent": "BTC5-15ArbBot/1.0",
-          },
-        });
-        
-        if (response.ok) {
-          const contentType = response.headers.get("content-type");
-          if (contentType && contentType.includes("application/json")) {
-            const data = await response.json() as { prices: [number, number][] };
-            
-            if (Array.isArray(data.prices) && data.prices.length > 0) {
-              // Get price closest to timestamp
-              const targetMs = timestamp * 1000;
-              const closest = data.prices.reduce((best, current) => {
-                const bestDiff = Math.abs(best[0] - targetMs);
-                const currentDiff = Math.abs(current[0] - targetMs);
-                return currentDiff < bestDiff ? current : best;
-              });
-              
-              if (closest[1]) {
-                logDebug(`Using CoinGecko historical price (matches Chainlink data)`);
-                return closest[1];
-              }
-            }
-          }
-        }
-      } catch (err) {
-        logDebug(`CoinGecko historical price failed: ${err}`);
-      }
-      
-      // Method 3: Current price if timestamp is very recent
-      const now = Math.floor(Date.now() / 1000);
-      if (Math.abs(timestamp - now) < 300) {
-        try {
-          const currentUrl = "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd";
-          const response = await fetch(currentUrl, {
-            headers: {
-              Accept: "application/json",
-              "User-Agent": "BTC5-15ArbBot/1.0",
-            },
-          });
-          
-          if (response.ok) {
-            const contentType = response.headers.get("content-type");
-            if (contentType && contentType.includes("application/json")) {
-              const data = await response.json() as { bitcoin?: { usd?: number } };
-              if (data.bitcoin?.usd) {
-                logDebug(`Using current CoinGecko price (timestamp is very recent)`);
-                return data.bitcoin.usd;
-              }
-            }
-          }
-        } catch (err) {
-          logDebug(`Current price fetch failed: ${err}`);
-        }
-      }
-      
-      return null;
-    } catch (error) {
-      logError("Failed to get Chainlink price:", error);
-      return null;
+      logDebug(`Beat price from ${field}: $${value} (market: ${market.slug})`);
+      return value;
     }
+    logWarn(`No beat price found in Gamma API data for market ${market.slug}`);
+    return null;
   }
 
   /**
-   * Get beat price from event
-   * Beat price = Chainlink BTC/USD price at market start time
-   * This is the correct method to fetch beat price for arbitrage bot
+   * Get beat price from a Gamma API event.
+   *
+   * Reads the strike price directly from the first market's `lowerBound` field.
+   * No external HTTP calls are made — the Gamma API data already contains the
+   * authoritative Chainlink price that Polymarket uses for settlement.
+   *
+   * Returns null if the field is absent or implausible; callers must treat null
+   * as a hard abort — tracking cannot proceed without an accurate strike price.
    */
-  async getBeatPriceFromEvent(event: GammaEvent): Promise<number | null> {
-    try {
-      logDebug(`Fetching beat price for event: ${event.slug} (title: ${event.title || "N/A"})`);
-      
-      // Extract market start timestamp
-      const startTimestamp = this.getMarketStartTimestamp(event);
-      if (!startTimestamp) {
-        logError(`Could not determine market start timestamp for event ${event.slug}`);
-        logError(`Event details: startDate=${event.startDate}, creationDate=${event.creationDate}`);
-        logError(`Markets count: ${event.markets?.length || 0}`);
-        if (event.markets && event.markets.length > 0) {
-          const firstMarket = event.markets[0];
-          logError(`First market keys: ${Object.keys(firstMarket || {}).join(", ")}`);
-          logError(`First market eventStartTime: ${(firstMarket as any)?.eventStartTime || "N/A"}`);
-          logError(`First market startDate: ${(firstMarket as any)?.startDate || "N/A"}`);
-        }
-        return null;
-      }
-
-      logDebug(`Market start timestamp: ${startTimestamp} (${new Date(startTimestamp * 1000).toISOString()})`);
-
-      // Get Chainlink price at market start time
-      const beatPrice = await this.getChainlinkPriceAtTimestamp(startTimestamp);
-      
-      if (beatPrice) {
-        logInfo(`✅ Beat price for ${event.slug}: $${beatPrice.toFixed(2)} (Chainlink BTC/USD at market start)`);
-      } else {
-        logError(`❌ Failed to fetch beat price for ${event.slug} (Chainlink price at market start)`);
-        logError(`Timestamp was: ${startTimestamp} (${new Date(startTimestamp * 1000).toISOString()})`);
-      }
-      
-      return beatPrice;
-    } catch (error) {
-      logError(`Failed to get beat price from event ${event.slug}:`, error);
+  getBeatPriceFromEvent(event: GammaEvent): number | null {
+    const market = event.markets?.[0];
+    if (!market) {
+      logWarn(`No markets found in Gamma API event ${event.slug} — cannot extract beat price`);
       return null;
     }
-  }
-
-  /**
-   * Extract beat price from Gamma API market data
-   * DEPRECATED: Use getBeatPriceFromEvent() instead
-   * Beat price should be fetched from Chainlink at market start time, not from market metadata
-   */
-  getBeatPriceFromMarket(market: GammaMarket): number | null {
-    logWarn("getBeatPriceFromMarket is deprecated. Use getBeatPriceFromEvent() instead.");
-    try {
-      // For BTC UP/DOWN markets, beat price is typically in lowerBound or upperBound
-      // Check lowerBound first (common for "above X" markets)
-      if (market.lowerBound !== undefined && market.lowerBound !== null) {
-        const value = typeof market.lowerBound === "string" 
-          ? parseFloat(market.lowerBound) 
-          : market.lowerBound;
-        if (!isNaN(value) && value > 0) {
-          logDebug(`Beat price from lowerBound: ${value}`);
-          return value;
-        }
-      }
-
-      // Check upperBound (for "below X" or range markets)
-      if (market.upperBound !== undefined && market.upperBound !== null) {
-        const value = typeof market.upperBound === "string" 
-          ? parseFloat(market.upperBound) 
-          : market.upperBound;
-        if (!isNaN(value) && value > 0) {
-          logDebug(`Beat price from upperBound: ${value}`);
-          return value;
-        }
-      }
-
-      // Check xAxisValue or yAxisValue as fallback
-      if (market.xAxisValue !== undefined && market.xAxisValue !== null) {
-        const value = typeof market.xAxisValue === "string" 
-          ? parseFloat(market.xAxisValue) 
-          : market.xAxisValue;
-        if (!isNaN(value) && value > 0) {
-          logDebug(`Beat price from xAxisValue: ${value}`);
-          return value;
-        }
-      }
-
-      logWarn(`No beat price found in market data for ${market.slug}`);
-      return null;
-    } catch (error) {
-      logError("Failed to extract beat price from market:", error);
-      return null;
-    }
-  }
-
-  /**
-   * Get BTC price at specific timestamp (for beat price) from Chainlink
-   * DEPRECATED: Use getBeatPriceFromEvent() instead
-   * This method is kept for backward compatibility only
-   */
-  async getBtcPriceAtTimestamp(timestamp: number): Promise<number | null> {
-    logWarn("getBtcPriceAtTimestamp is deprecated. Use getBeatPriceFromEvent() instead.");
-    return this.getChainlinkPriceAtTimestamp(timestamp);
+    return this.extractBeatPrice(market);
   }
 
   /**
