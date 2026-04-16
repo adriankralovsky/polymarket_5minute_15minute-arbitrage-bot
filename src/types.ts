@@ -216,6 +216,8 @@ export interface SimulationResult {
   totalTrades: number;
   successfulTrades: number;
   failedTrades: number;
+  /** Trades where the market result was still PENDING — excluded from PnL. */
+  unresolvedTrades: number;
   winRate: number;
   totalPnL: number;
   pnlCurve: Array<{ timestamp: number; cumulativePnL: number }>;

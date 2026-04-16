@@ -74,6 +74,8 @@ async function main(): Promise<void> {
 
       logInfo(`Simulation results for ${logFile}:`, {
         totalTrades: result.totalTrades,
+        resolvedTrades: result.successfulTrades - result.unresolvedTrades,
+        unresolvedTrades: result.unresolvedTrades,
         winRate: result.winRate,
         totalPnL: result.totalPnL,
         maxDrawdown: result.maxDrawdown,
