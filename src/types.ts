@@ -4,7 +4,7 @@
 
 export type MarketType = "5m" | "15m";
 export type TokenSide = "up" | "down";
-export type TradeStatus = "filled" | "canceled" | "failed" | "pending" | "partial_unwind";
+export type TradeStatus = "filled" | "canceled" | "failed" | "pending" | "partial_unwind" | "simulated";
 export type MarketResult = "UP" | "DOWN" | "PENDING";
 
 /**

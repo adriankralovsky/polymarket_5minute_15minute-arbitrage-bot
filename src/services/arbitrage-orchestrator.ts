@@ -3,6 +3,7 @@
  * Implements latency-aware architecture with risk controls
  */
 
+import { randomUUID } from "crypto";
 import { PolymarketClient } from "../clients/polymarket";
 import { MarketDataManager } from "./market-data-manager";
 import { ArbitrageDetector } from "./arbitrage-detector";
@@ -348,12 +349,8 @@ export class ArbitrageOrchestrator {
       // Log to JSON (requirement 9.2)
       this.jsonLogger.logSyncDetected(market5m, market15m, opportunity);
 
-      // Execute trade
-      if (this.config.enableTrading) {
-        await this.executeArbitrageTrade(market5m, market15m, opportunity);
-      } else {
-        logInfo("Trading disabled, skipping execution");
-      }
+      // Execute trade (live) or record a paper trade (ENABLE_TRADING=false)
+      await this.executeArbitrageTrade(market5m, market15m, opportunity);
     }
   }
 
@@ -415,6 +412,39 @@ export class ArbitrageOrchestrator {
       quantity: this.config.defaultQuantity,
     };
 
+    // ── Paper trade (ENABLE_TRADING=false) ───────────────────────────────────
+    if (!this.config.enableTrading) {
+      const sumPrice = adjustedUpPrice + adjustedDownPrice;
+      const paperExecution: TradeExecution = {
+        tradeId:      randomUUID(),
+        timestamp:    Date.now(),
+        market5Id:    market5m.marketId,
+        market15Id:   market15m.marketId,
+        direction:    { upMarket, downMarket },
+        prices: {
+          upPrice:  adjustedUpPrice,
+          downPrice: adjustedDownPrice,
+          sumPrice,
+        },
+        quantity:     this.config.defaultQuantity,
+        latencyMs:    0,
+        status:       "simulated",
+        pnlEstimate:  1.0 - sumPrice,
+      };
+      logInfo(
+        `[PAPER TRADE] case=${opportunity.case} ` +
+        `sum=${sumPrice.toFixed(4)} ` +
+        `pnl=${paperExecution.pnlEstimate.toFixed(4)} ` +
+        `(up=${adjustedUpPrice.toFixed(4)} down=${adjustedDownPrice.toFixed(4)}) ` +
+        `— recorded to DB, no real capital spent`,
+      );
+      await this.storeTradeRecord(market5m, market15m, paperExecution);
+      this.jsonLogger.logTradeExecution(market5m, market15m, paperExecution);
+      this.dailyTradeCount++;
+      return;
+    }
+
+    // ── Live trade ────────────────────────────────────────────────────────────
     logInfo(`Executing arbitrage trade: ${opportunity.case}, sum=${opportunity.prices.sumPrice.toFixed(4)}`);
 
     try {
