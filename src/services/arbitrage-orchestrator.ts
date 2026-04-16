@@ -24,6 +24,9 @@ export class ArbitrageOrchestrator {
   private config = getConfig();
   private isRunning = false;
   private isProcessingArb = false; // re-entrancy guard for processSynchronizedMarkets
+  // Set permanently on UnwindFailedError halt — blocks all further trading even
+  // if isProcessingArb is cleared before stop() finishes.
+  private isHalting = false;
   private monitoringInterval: NodeJS.Timeout | null = null;
   private dailyTradeCount = 0;
   private lastTradeDate = new Date().toDateString();
@@ -48,7 +51,9 @@ export class ArbitrageOrchestrator {
         this.handleMarketDataUpdate(marketType, data);
       },
       onSyncDetected: (market5m, market15m) => {
-        this.handleSyncDetected(market5m, market15m);
+        this.handleSyncDetected(market5m, market15m).catch((err) => {
+          logError("handleSyncDetected unhandled error:", err);
+        });
       },
       onError: (error) => {
         logError("Market data manager error:", error);
@@ -176,6 +181,7 @@ export class ArbitrageOrchestrator {
    * Main monitoring loop
    */
   private async monitoringLoop(): Promise<void> {
+    if (this.isHalting) return; // bot is shutting down after unwind failure
     try {
       // Reset daily trade count if new day
       const currentDate = new Date().toDateString();
@@ -286,6 +292,10 @@ export class ArbitrageOrchestrator {
    * duplicate trades for the same opportunity.
    */
   private async processSynchronizedMarkets(market5m: MarketData, market15m: MarketData): Promise<void> {
+    if (this.isHalting) {
+      logDebug("Arb check skipped — bot is halting after unwind failure");
+      return;
+    }
     if (this.isProcessingArb) {
       logDebug("Arb check skipped — previous execution still in flight");
       return;
@@ -364,11 +374,6 @@ export class ArbitrageOrchestrator {
     const upTokenId = upMarket === "5m" ? market5m.tokens.upTokenId : market15m.tokens.upTokenId;
     const downTokenId = downMarket === "5m" ? market5m.tokens.downTokenId : market15m.tokens.downTokenId;
 
-    const orderType = this.detector.getOrderType(opportunity);
-    const limitPrice = orderType === "limit"
-      ? this.detector.calculateLimitPrice(opportunity.prices.upPrice, opportunity)
-      : undefined;
-
     // Apply history-based slippage estimates to each leg's order price.
     // For FOK orders this sets the maximum price we're willing to pay,
     // accommodating tick-level movement between detection and submission.
@@ -402,11 +407,11 @@ export class ArbitrageOrchestrator {
       downTokenId,
       upMarket,
       downMarket,
+      market5mId:  market5m.marketId,
+      market15mId: market15m.marketId,
       upPrice: adjustedUpPrice,
       downPrice: adjustedDownPrice,
       quantity: this.config.defaultQuantity,
-      orderType,
-      limitPrice,
     };
 
     logInfo(`Executing arbitrage trade: ${opportunity.case}, sum=${opportunity.prices.sumPrice.toFixed(4)}`);
@@ -420,8 +425,10 @@ export class ArbitrageOrchestrator {
       this.dailyTradeCount++;
     } catch (error) {
       if (error instanceof UnwindFailedError) {
-        // A naked position exists. Persist the partial execution record for
-        // post-mortem, then halt immediately. Do NOT continue trading.
+        // A naked position exists. Set isHalting FIRST — before the finally
+        // block of processSynchronizedMarkets clears isProcessingArb — so the
+        // monitoring loop cannot fire another trade while stop() is still running.
+        this.isHalting = true;
         logError(
           `[CRITICAL] UNWIND FAILED — HALTING BOT IMMEDIATELY.\n${error.message}`,
         );

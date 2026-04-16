@@ -105,10 +105,11 @@ const BASE_PARAMS: TradeParams = {
   downTokenId: "0xDOWN_TOKEN_BBBB1111222233334444555566667777888899990000",
   upMarket:    "5m",
   downMarket:  "15m",
+  market5mId:  "market-5m-test",
+  market15mId: "market-15m-test",
   upPrice:     0.45,
   downPrice:   0.42,
   quantity:    10,
-  orderType:   "market",
 };
 
 // ─── Scenario 1 — Clean arbitrage (both legs fill) ───────────────────────────

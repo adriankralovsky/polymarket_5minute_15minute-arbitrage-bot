@@ -303,10 +303,13 @@ export class PolymarketClient {
       if (raw === undefined || raw === null) continue;
       const value = typeof raw === "string" ? parseFloat(raw) : (raw as number);
       if (isNaN(value)) continue;
-      if (value < 1_000 || value > 10_000_000) {
+      // BTC/USD lower bound: $10,000 avoids false positives from integer fields
+      // (IDs, basis points, percentages) that are numerically below any real BTC price.
+      // Upper bound: $10,000,000 gives a ~119x headroom above current spot.
+      if (value < 10_000 || value > 10_000_000) {
         logWarn(
           `Beat price candidate ${value} from field "${field}" on market ${market.slug} ` +
-          `is outside plausible BTC/USD range [1 000, 10 000 000] — ignoring`,
+          `is outside plausible BTC/USD range [10 000, 10 000 000] — ignoring`,
         );
         continue;
       }
@@ -320,20 +323,28 @@ export class PolymarketClient {
   /**
    * Get beat price from a Gamma API event.
    *
-   * Reads the strike price directly from the first market's `lowerBound` field.
+   * Searches all sub-markets for the first one that carries a valid `lowerBound`
+   * (or fallback field). 15m events may have multiple sub-market entries and the
+   * strike price is not guaranteed to be on index 0.
+   *
    * No external HTTP calls are made — the Gamma API data already contains the
    * authoritative Chainlink price that Polymarket uses for settlement.
    *
-   * Returns null if the field is absent or implausible; callers must treat null
-   * as a hard abort — tracking cannot proceed without an accurate strike price.
+   * Returns null if no market carries a plausible beat price; callers must treat
+   * null as a hard abort — tracking cannot proceed without an accurate strike price.
    */
   getBeatPriceFromEvent(event: GammaEvent): number | null {
-    const market = event.markets?.[0];
-    if (!market) {
+    const markets = event.markets ?? [];
+    if (markets.length === 0) {
       logWarn(`No markets found in Gamma API event ${event.slug} — cannot extract beat price`);
       return null;
     }
-    return this.extractBeatPrice(market);
+    for (const market of markets) {
+      const value = this.extractBeatPrice(market);
+      if (value !== null) return value;
+    }
+    logWarn(`No valid beat price found in any sub-market of event ${event.slug}`);
+    return null;
   }
 
   /**

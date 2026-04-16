@@ -532,7 +532,15 @@ export class MarketDataManager {
     // Use Math.floor so endTime is always an integer Unix timestamp.
     // A sub-second endDate (e.g. "...T12:05:00.500Z") would produce a float,
     // causing the === endTime sync-check to fail intermittently.
-    const endTime = Math.floor(new Date(event.endDate).getTime() / 1000);
+    const endTimeMs = new Date(event.endDate).getTime();
+    if (isNaN(endTimeMs)) {
+      logError(
+        `Invalid endDate "${event.endDate}" for ${marketType} market (slug: ${event.slug}) — ` +
+        `aborting market initialization`,
+      );
+      return null;
+    }
+    const endTime = Math.floor(endTimeMs / 1000);
 
     // NOTE: For arbitrage bot, we rely ONLY on WebSocket for real-time prices
     // Initial prices will be set to null and updated via WebSocket

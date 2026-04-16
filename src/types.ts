@@ -99,11 +99,12 @@ export interface TradeParams {
   downTokenId: string;
   upMarket: MarketType;
   downMarket: MarketType;
+  /** Actual market IDs (not token IDs) for trade-record labelling. */
+  market5mId: string;
+  market15mId: string;
   upPrice: number;
   downPrice: number;
   quantity: number;
-  orderType: "market" | "limit";
-  limitPrice?: number;
 }
 
 /**

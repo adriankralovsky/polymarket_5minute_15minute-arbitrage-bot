@@ -313,8 +313,8 @@ export class TradeExecutor {
     return {
       tradeId,
       timestamp: Date.now(),
-      market5Id: params.upMarket === "5m" ? params.upTokenId : params.downTokenId,
-      market15Id: params.upMarket === "15m" ? params.upTokenId : params.downTokenId,
+      market5Id:  params.market5mId,
+      market15Id: params.market15mId,
       direction: {
         upMarket: params.upMarket,
         downMarket: params.downMarket,

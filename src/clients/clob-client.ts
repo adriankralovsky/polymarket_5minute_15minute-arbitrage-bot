@@ -3,6 +3,7 @@
  * Implements EOA wallet approval and order execution
  */
 
+import { createHmac } from "crypto";
 import { ethers } from "ethers";
 import { logInfo, logError, logWarn, logDebug } from "../utils/logger";
 import { retry } from "../utils/retry";
@@ -123,8 +124,11 @@ export class ClobClient {
   private provider: ethers.JsonRpcProvider | ethers.FallbackProvider;
   private signatureType: number;
   private funder: string | null = null;
+  // L2 API-key credentials — required for account-scoped REST calls
+  // (getOpenOrders, cancelOrder). These are SEPARATE from the trading wallet.
   private apiKey: string | null = null;
   private apiSecret: string | null = null;
+  private apiPassphrase: string | null = null;
   private nonce: number | null = null; // Exchange nonce (fetched from API)
 
   constructor() {
@@ -161,11 +165,52 @@ export class ClobClient {
       }
     }
 
+    // L2 API credentials (for order cancellation and account reads)
+    this.apiKey        = process.env.POLY_API_KEY?.trim()        ?? null;
+    this.apiSecret     = process.env.POLY_API_SECRET?.trim()     ?? null;
+    this.apiPassphrase = process.env.POLY_API_PASSPHRASE?.trim() ?? null;
+
+    if (!this.apiKey || !this.apiSecret || !this.apiPassphrase) {
+      logWarn(
+        "POLY_API_KEY / POLY_API_SECRET / POLY_API_PASSPHRASE not set. " +
+        "Pre-expiry order cancellation will be disabled. " +
+        "Set these credentials to enable safe order management.",
+      );
+    }
+
     logInfo("CLOB Client initialized", {
       address: this.wallet.address,
       signatureType: this.signatureType,
       funder: this.funder || "none",
+      l2Auth: this.apiKey ? "configured" : "missing",
     });
+  }
+
+  /**
+   * Build Polymarket L2 API authentication headers.
+   *
+   * Account-scoped REST endpoints (order reads, order cancels) require HMAC-SHA256
+   * authentication using the CLOB API key — NOT the trading wallet signature.
+   *
+   * Signature: base64( HMAC-SHA256( apiSecret, timestamp + METHOD + path + body ) )
+   * Per py-clob-client: https://github.com/Polymarket/py-clob-client
+   */
+  private buildL2AuthHeaders(
+    method: string,
+    requestPath: string,
+    body: string = "",
+  ): Record<string, string> {
+    const timestamp = Math.floor(Date.now() / 1000).toString();
+    const message   = timestamp + method.toUpperCase() + requestPath + body;
+    const signature = createHmac("sha256", this.apiSecret!)
+      .update(message)
+      .digest("base64");
+    return {
+      "POLY-TIMESTAMP":  timestamp,
+      "POLY-SIGNATURE":  signature,
+      "POLY-API-KEY":    this.apiKey!,
+      "POLY-PASSPHRASE": this.apiPassphrase!,
+    };
   }
 
   /**
@@ -687,9 +732,12 @@ export class ClobClient {
       // at $0.01/share the $1 floor would force an unreasonably large size.
       // We sell exactly what we hold.
 
-      // Ensure takerAmount (price * size) has <= 2 decimal places
+      // Ensure takerAmount (price * size) has <= 2 decimal places.
+      // Round DOWN (not up) — selling more than the held position would cause
+      // the exchange to reject the order, leaving a naked position open.
       while (this.decimalPlaces(roundedPrice * roundedSize) > 2) {
-        roundedSize = Math.round((roundedSize + 0.01) * 100) / 100;
+        roundedSize = Math.round((roundedSize - 0.01) * 100) / 100;
+        if (roundedSize <= 0) break;
       }
 
       const orderArgs: OrderArgs = {
@@ -875,6 +923,11 @@ export class ClobClient {
       // Nonces are already incremented eagerly during order creation above.
       return mappedResults;
     } catch (error) {
+      // Nonces were incremented eagerly before the HTTP call. If the call threw,
+      // the exchange never saw those nonces — the local counter is now ahead of
+      // the on-chain state. Reset to null so the next attempt re-fetches the
+      // authoritative nonce from the API rather than using a stale local value.
+      this.nonce = null;
       logError("Failed to place batch orders:", error);
       return orders.map(() => ({
         error: error instanceof Error ? error.message : String(error),
@@ -884,34 +937,39 @@ export class ClobClient {
 
   /**
    * Get all open (LIVE) orders for this wallet.
-   * Used by cancelOrdersForTokens to find orders that need pre-expiry cancellation.
+   * Requires L2 API-key auth (POLY_API_KEY / POLY_API_SECRET / POLY_API_PASSPHRASE).
+   * Returns an empty array (with a warning) if credentials are not configured.
    */
   async getOpenOrders(): Promise<Array<{ orderID: string; tokenId: string; status: string }>> {
+    if (!this.apiKey || !this.apiSecret || !this.apiPassphrase) {
+      logWarn("getOpenOrders: L2 API credentials not configured — skipping");
+      return [];
+    }
     try {
-      const url = `${CLOB_HOST}/orders?maker=${this.wallet.address}&status=LIVE`;
-      const response = await fetch(url);
+      const path = `/orders?maker=${this.wallet.address}&status=LIVE`;
+      const url  = `${CLOB_HOST}${path}`;
+      const authHeaders = this.buildL2AuthHeaders("GET", path);
+      const response = await fetch(url, { headers: authHeaders });
       if (!response.ok) {
-        logWarn(`getOpenOrders failed: HTTP ${response.status}`);
+        const body = await response.text();
+        logWarn(`getOpenOrders failed: HTTP ${response.status} — ${body}`);
         return [];
       }
-      const data = (await response.json()) as Array<{
-        orderID?: string;
-        order_id?: string;
-        tokenId?: string;
-        token_id?: string;
-        asset_id?: string;
-        status?: string;
-        [key: string]: unknown;
-      }>;
-      if (!Array.isArray(data)) {
-        logWarn("getOpenOrders: unexpected response shape");
-        return [];
+      // Handle both bare-array and enveloped responses (e.g. { orders: [...] })
+      const raw = (await response.json()) as unknown;
+      const data: unknown[] = Array.isArray(raw)
+        ? raw
+        : Array.isArray((raw as { orders?: unknown[] }).orders)
+          ? (raw as { orders: unknown[] }).orders
+          : [];
+      if (data.length === 0 && !Array.isArray(raw)) {
+        logWarn("getOpenOrders: unexpected response shape — could not extract order list");
       }
-      return data
+      return (data as Array<Record<string, unknown>>)
         .map((o) => ({
-          orderID:  o.orderID  ?? o.order_id  ?? "",
-          tokenId:  o.tokenId  ?? o.token_id  ?? o.asset_id ?? "",
-          status:   o.status   ?? "LIVE",
+          orderID: (o["orderID"] ?? o["order_id"] ?? "") as string,
+          tokenId: (o["tokenId"] ?? o["token_id"] ?? o["asset_id"] ?? "") as string,
+          status:  (o["status"] ?? "LIVE") as string,
         }))
         .filter((o) => o.orderID !== "");
     } catch (error) {
@@ -950,24 +1008,39 @@ export class ClobClient {
   }
 
   /**
-   * Cancel an order
+   * Cancel an order.
+   *
+   * Uses Polymarket L2 API-key authentication (HMAC-SHA256). The cancel endpoint
+   * is an off-chain REST action — it does NOT require an EIP-712/EIP-191 wallet
+   * signature. Using the wallet signature here would result in a 401 from the API.
+   *
+   * Requires POLY_API_KEY / POLY_API_SECRET / POLY_API_PASSPHRASE to be set.
    */
   async cancelOrder(orderId: string): Promise<boolean> {
+    if (!this.apiKey || !this.apiSecret || !this.apiPassphrase) {
+      logWarn(`Cannot cancel order ${orderId}: L2 API credentials not configured`);
+      return false;
+    }
     try {
-      const url = `${CLOB_HOST}/order/${orderId}`;
-      const message = JSON.stringify({ order_id: orderId });
-      const signature = await this.wallet.signMessage(ethers.toUtf8Bytes(message));
+      const path = `/order/${orderId}`;
+      const url  = `${CLOB_HOST}${path}`;
+      const authHeaders = this.buildL2AuthHeaders("DELETE", path);
 
       const response = await fetch(url, {
         method: "DELETE",
         headers: {
           "Content-Type": "application/json",
-          "X-Address": this.wallet.address,
-          "X-Signature": signature,
+          ...authHeaders,
         },
       });
 
-      return response.ok;
+      if (!response.ok) {
+        const body = await response.text();
+        logError(`cancelOrder failed for ${orderId}: HTTP ${response.status} — ${body}`);
+        return false;
+      }
+
+      return true;
     } catch (error) {
       logError("Failed to cancel order:", error);
       return false;

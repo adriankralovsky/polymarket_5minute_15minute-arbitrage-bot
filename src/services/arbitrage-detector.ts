@@ -359,11 +359,4 @@ export class ArbitrageDetector {
     return "limit";
   }
 
-  /**
-   * Calculate limit price with allowed slippage
-   */
-  calculateLimitPrice(executablePrice: number, opportunity: ArbitrageOpportunity): number {
-    const slippage = this.config.maxSlippage;
-    return executablePrice * (1 + slippage);
-  }
 }

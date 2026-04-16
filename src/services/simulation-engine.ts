@@ -86,10 +86,11 @@ export class SimulationEngine {
               : market15m.tokens.downTokenId,
           upMarket: opportunity.direction!.upMarket,
           downMarket: opportunity.direction!.downMarket,
+          market5mId:  market5m.marketId,
+          market15mId: market15m.marketId,
           upPrice: opportunity.prices.upPrice,
           downPrice: opportunity.prices.downPrice,
           quantity: this.config.defaultQuantity,
-          orderType: this.detector.getOrderType(opportunity),
         };
 
         const execution = await this.executor.executeTradeBatch(tradeParams);
