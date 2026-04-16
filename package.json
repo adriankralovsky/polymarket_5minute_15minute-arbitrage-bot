@@ -11,21 +11,28 @@
     "simulate": "ts-node src/simulate.ts",
     "test-beat-price": "ts-node src/test-beat-price.ts"
   },
-  "keywords": ["polymarket", "arbitrage", "trading", "btc", "binary-options"],
+  "keywords": [
+    "polymarket",
+    "arbitrage",
+    "trading",
+    "btc",
+    "binary-options"
+  ],
   "author": "",
   "license": "ISC",
   "type": "commonjs",
   "dependencies": {
+    "@polymarket/clob-client": "^5.8.1",
     "@types/node": "^20.0.0",
+    "@types/uuid": "^9.0.7",
+    "@types/ws": "^8.5.10",
     "dotenv": "^16.4.5",
     "ethers": "^6.16.0",
+    "mongodb": "^6.3.0",
     "ts-node": "^10.9.2",
     "typescript": "^5.9.3",
-    "ws": "^8.18.0",
-    "@types/ws": "^8.5.10",
-    "mongodb": "^6.3.0",
     "uuid": "^9.0.1",
-    "@types/uuid": "^9.0.7"
+    "ws": "^8.18.0"
   },
   "devDependencies": {
     "@types/node": "^20.0.0"
