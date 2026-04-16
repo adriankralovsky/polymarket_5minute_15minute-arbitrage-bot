@@ -206,17 +206,33 @@ export class ArbitrageOrchestrator {
           const oldMarkets5m = this.marketDataManager.getMarketsByType("5m");
           const oldMarkets15m = this.marketDataManager.getMarketsByType("15m");
 
-          // ── Resolve BEFORE unsubscribing ──────────────────────────────────
-          // unsubscribeFromMarket() removes the market from the cache. If we
-          // unsubscribe first, the post-rollover loop finds no old markets and
-          // resolveMarket() never fires. Capture references and kick off
-          // resolution while they are still accessible.
-          for (const market of [...oldMarkets5m, ...oldMarkets15m]) {
-            if (!this.resolvedMarkets.has(market.marketId)) {
-              logInfo(`Triggering resolution for expiring market ${market.marketId} (${market.marketType})`);
-              this.resolveMarket(market).catch((error) => {
-                logError(`Failed to resolve market ${market.marketId} during rollover:`, error);
+          // ── Resolve BEFORE unsubscribing ────────────────────────────────────
+          // resolveMarket() waits up to 5s for the oracle, then looks up the
+          // paired market. By that time the loop below will have already cleared
+          // the cache via unsubscribeFromMarket(). Pass the paired market reference
+          // NOW while we still have it, so resolveMarket never needs to touch
+          // the cache at all.
+          const oldPair5m  = oldMarkets5m[0]  ?? null;
+          const oldPair15m = oldMarkets15m[0] ?? null;
+          if (oldPair5m && oldPair15m && oldPair5m.endTime === oldPair15m.endTime) {
+            if (!this.resolvedMarkets.has(oldPair5m.marketId) && !this.resolvedMarkets.has(oldPair15m.marketId)) {
+              logInfo(
+                `Triggering resolution for expiring pair ` +
+                `5m=${oldPair5m.marketId} / 15m=${oldPair15m.marketId}`,
+              );
+              this.resolveMarket(oldPair5m, oldPair15m).catch((error) => {
+                logError(`Failed to resolve market pair during rollover:`, error);
               });
+            }
+          } else {
+            // Markets don't form a synchronized pair — resolve individually.
+            for (const market of [...oldMarkets5m, ...oldMarkets15m]) {
+              if (!this.resolvedMarkets.has(market.marketId)) {
+                logInfo(`Triggering solo resolution for expiring market ${market.marketId} (${market.marketType})`);
+                this.resolveMarket(market, null).catch((error) => {
+                  logError(`Failed to resolve market ${market.marketId} during rollover:`, error);
+                });
+              }
             }
           }
 
@@ -281,12 +297,14 @@ export class ArbitrageOrchestrator {
           });
         }
 
-        // Resolve market after endTime (fetch finalFinishPrice and write to log).
-        // Also handled at rollover time; this catches the edge case where the
-        // market expires without a rollover firing first (e.g. bot started
-        // mid-window and shouldSwitchMarkets never returned true for this window).
+        // Resolve market after endTime — fallback for markets that expire without
+        // triggering a rollover (e.g. bot started mid-window).
         if (timeToEnd <= 0 && !this.resolvedMarkets.has(market.marketId)) {
-          this.resolveMarket(market).catch((error) => {
+          // Find the paired market NOW while it's still in cache.
+          const otherType: "5m" | "15m" = market.marketType === "5m" ? "15m" : "5m";
+          const pairedMarket = this.marketDataManager.getMarketsByType(otherType)
+            .find((m) => m.endTime === market.endTime) ?? null;
+          this.resolveMarket(market, pairedMarket).catch((error) => {
             logError(`Failed to resolve market ${market.marketId}:`, error);
           });
         }
@@ -299,10 +317,16 @@ export class ArbitrageOrchestrator {
   /**
    * Fetch the final resolution for a market after its endTime and write it
    * to the JSON log so the simulator can score trades accurately.
+   *
+   * @param market       The market to resolve.
+   * @param pairedMarket The other market in the pair, passed by caller so this
+   *                     method never needs to touch the cache (which may already
+   *                     be cleared by the time the oracle wait completes).
    */
-  private async resolveMarket(market: MarketData): Promise<void> {
-    // Mark immediately to prevent duplicate concurrent resolve calls.
+  private async resolveMarket(market: MarketData, pairedMarket: MarketData | null): Promise<void> {
+    // Mark both immediately to prevent duplicate concurrent resolve calls.
     this.resolvedMarkets.add(market.marketId);
+    if (pairedMarket) this.resolvedMarkets.add(pairedMarket.marketId);
 
     // Give Polymarket's oracle a few seconds to settle after endTime.
     const msSinceEnd = Date.now() - market.endTime * 1000;
@@ -316,51 +340,42 @@ export class ArbitrageOrchestrator {
       const finalFinishPrice = await this.client.getFinalBtcPrice(market.endTime);
       if (finalFinishPrice === null) {
         logWarn(`Could not fetch final BTC price for market ${market.marketId} — will retry next tick`);
-        this.resolvedMarkets.delete(market.marketId); // allow retry
+        this.resolvedMarkets.delete(market.marketId);
+        if (pairedMarket) this.resolvedMarkets.delete(pairedMarket.marketId);
         return;
       }
 
-      // Determine result for this individual market based on whether BTC
-      // finished above or below the beat price.
+      // Resolve the primary market.
       const beatPrice = market.beatPrice?.value ?? 0;
       const result: "UP" | "DOWN" = finalFinishPrice > beatPrice ? "UP" : "DOWN";
-
-      // Update in-memory market state
       market.finalFinishPrice = finalFinishPrice;
       market.result = result;
-
       logInfo(
         `Market ${market.marketId} (${market.marketType}) resolved: ` +
         `BTC=${finalFinishPrice} beat=${beatPrice} → ${result}`,
       );
 
-      // Find the paired market so we can write both results to the JSON log.
-      const otherType: "5m" | "15m" = market.marketType === "5m" ? "15m" : "5m";
-      const pairedMarket = this.marketDataManager.getMarketsByType(otherType)
-        .find((m) => m.endTime === market.endTime);
+      // Resolve the paired market using the same finalFinishPrice.
+      if (pairedMarket && pairedMarket.result === "PENDING") {
+        const pairedBeat   = pairedMarket.beatPrice?.value ?? 0;
+        const pairedResult: "UP" | "DOWN" = finalFinishPrice > pairedBeat ? "UP" : "DOWN";
+        pairedMarket.finalFinishPrice = finalFinishPrice;
+        pairedMarket.result = pairedResult;
+        logInfo(
+          `Market ${pairedMarket.marketId} (${pairedMarket.marketType}) resolved: ` +
+          `BTC=${finalFinishPrice} beat=${pairedBeat} → ${pairedResult}`,
+        );
+      }
 
       if (pairedMarket) {
-        // Also resolve the paired market if not done yet.
-        if (pairedMarket.result === "PENDING") {
-          const pairedResult: "UP" | "DOWN" = finalFinishPrice > (pairedMarket.beatPrice?.value ?? 0) ? "UP" : "DOWN";
-          pairedMarket.finalFinishPrice = finalFinishPrice;
-          pairedMarket.result = pairedResult;
-          this.resolvedMarkets.add(pairedMarket.marketId);
-          logInfo(
-            `Market ${pairedMarket.marketId} (${pairedMarket.marketType}) resolved: ` +
-            `BTC=${finalFinishPrice} beat=${pairedMarket.beatPrice?.value ?? 0} → ${pairedResult}`,
-          );
-        }
-
         const market5m  = market.marketType === "5m" ? market : pairedMarket;
         const market15m = market.marketType === "15m" ? market : pairedMarket;
 
-        // Write finalResolution to the JSON log file.
         this.jsonLogger.logFinalResolution(
           market5m,
           market15m,
           finalFinishPrice,
-          market5m.result as "UP" | "DOWN",
+          market5m.result  as "UP" | "DOWN",
           market15m.result as "UP" | "DOWN",
         );
 
@@ -368,21 +383,22 @@ export class ArbitrageOrchestrator {
           `JSON log updated with finalResolution: 5m=${market5m.result} 15m=${market15m.result} ` +
           `finishPrice=${finalFinishPrice}`,
         );
-      } else {
-        logWarn(
-          `Could not find paired ${otherType} market for resolution logging ` +
-          `(market ${market.marketId}, endTime ${market.endTime})`,
-        );
-      }
 
-      // Persist resolution to database.
-      await this.storeMarketData(market);
-      if (pairedMarket) await this.storeMarketData(pairedMarket);
+        await this.storeMarketData(market5m);
+        await this.storeMarketData(market15m);
+      } else {
+        // No paired market available — still persist what we have.
+        logWarn(
+          `No paired market reference for resolution of ${market.marketId} — ` +
+          `JSON log finalResolution will NOT be written for this window`,
+        );
+        await this.storeMarketData(market);
+      }
 
     } catch (error) {
       logError(`Error resolving market ${market.marketId}:`, error);
-      // Allow retry on next monitoring tick.
       this.resolvedMarkets.delete(market.marketId);
+      if (pairedMarket) this.resolvedMarkets.delete(pairedMarket.marketId);
     }
   }
 
