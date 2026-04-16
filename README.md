@@ -4,7 +4,7 @@ Production-grade BTC binary prediction market arbitrage bot for Polymarket.
 
 ## Overview
 
-This bot monitors BTC 5-minute and 15-minute binary prediction markets and executes arbitrage trades when synchronized markets (same `endTime`) are detected.
+This bot monitors BTC 5-minute and 15-minute binary prediction markets and executes arbitrage trades when synchronized markets (same `endTime`) are detected. The architecture is built around a **Zero Naked Exposure** guarantee: if only one leg of a two-leg trade fills, the filled position is immediately unwound before the bot can take any further action.
 
 ## Critical Concept: Beat Price
 
@@ -33,15 +33,72 @@ The bot evaluates arbitrage only when `endTime_5m == endTime_15m` (both markets 
 ### Case C: Equal beat prices
 - Check both sums and execute the first valid
 
+## Zero Naked Exposure Architecture
+
+The Polymarket batch order endpoint is **not atomic** — the matching engine processes legs sequentially. This means one leg can fill while the other misses, leaving a naked directional position.
+
+The bot handles this with a two-stage execution model:
+
+1. **Place both legs** (UP and DOWN) as FOK orders
+2. **Detect partial fill**: if only one leg is matched, trigger immediate unwind
+3. **Unwind**: submit a FAK SELL at `$0.01` (sweeps all bids) for the filled leg
+4. **If unwind fails**: throw `UnwindFailedError`, persist a `partial_unwind` record to MongoDB, and **halt the bot immediately** — no further trades are attempted
+
+```
+executeTradeBatch()
+  ├─ place UP leg (FOK)
+  ├─ place DOWN leg (FOK)
+  ├─ both filled → success ✓
+  ├─ neither filled → clean miss ✓
+  └─ one filled, one missed
+       ├─ unwindPosition() → FAK SELL at $0.01
+       ├─ unwind success → log partial_unwind, continue ✓
+       └─ unwind fails → UnwindFailedError → HALT BOT ✗
+```
+
+### Trade Statuses
+
+| Status | Meaning |
+|---|---|
+| `filled` | Both legs matched; full arbitrage executed |
+| `canceled` | Neither leg filled (clean miss) |
+| `failed` | Unexpected API/network error |
+| `partial_unwind` | One leg filled, unwind triggered — **requires manual review** |
+
+## Execution Safety Features
+
+### Volatility Filter
+
+Before executing any trade, the bot checks whether the market is moving too fast to enter safely:
+- Computes `max(price) - min(price)` over the recent 60-snapshot history window (~30 seconds)
+- Aborts the trade if the range exceeds `MAX_PRICE_VOLATILITY` on either the UP or DOWN side
+- The filter is dormant until `MIN_HISTORY_FOR_FILTER` snapshots have accumulated (prevents false positives on startup)
+
+### Dynamic Slippage Estimation
+
+Instead of a flat slippage allowance, each trade leg gets an individually estimated slippage:
+- Computes average absolute tick-to-tick price change from history
+- Expresses as a fraction of current price with a 1.5× safety buffer
+- Clamped to `[MAX_SLIPPAGE, 2 × MAX_SLIPPAGE]`
+- If slippage-adjusted sum ≥ `ARB_THRESHOLD`, the trade is skipped as no longer profitable
+
+### Market Data Write Throttle
+
+WebSocket ticks arrive at 100+ per second. The bot throttles MongoDB market-data writes to once per **5 seconds per market**, preventing async operation backpressure and heap memory exhaustion.
+
 ## Features
 
 - **Real-time WebSocket feeds** for market data
-- **Atomic trade execution** with ≤50ms timeout
+- **Zero Naked Exposure** guarantee via emergency unwind
+- **Volatility gate** — skips trades during fast-moving markets
+- **Dynamic slippage estimation** — per-leg, history-based
+- **Atomic trade execution** targeting ≤50ms latency
 - **MongoDB persistence** for trade records and market data
 - **JSON logging** for market pairs
 - **Simulation/backtesting** engine
 - **Latency-aware architecture** with stale-data protection
 - **Risk controls** (daily trade limits, position sizing)
+- **Window rollover detection** — auto-switches to current 5m/15m markets
 
 ## Installation
 
@@ -52,14 +109,23 @@ npm run build
 
 ## Configuration
 
-Create a `.env` file:
+Copy `.env.example` to `.env` and fill in your values:
+
+```bash
+cp .env.example .env
+```
+
+Key variables:
 
 ```env
-# Arbitrage threshold (default: 0.9)
+# Arbitrage threshold — sum of both legs must be below this (default: 0.9)
 ARB_THRESHOLD=0.9
 
-# Slippage buffer (default: 0.05)
+# Slippage buffer — gap below threshold that triggers market vs limit orders (default: 0.05)
 SLIPPAGE_BUFFER=0.05
+
+# Flat maximum slippage per leg; also used as dynamic estimate floor (default: 0.02)
+MAX_SLIPPAGE=0.02
 
 # Execution timeout in ms (default: 50)
 EXECUTION_TIMEOUT_MS=50
@@ -68,96 +134,118 @@ EXECUTION_TIMEOUT_MS=50
 MONGO_URI=mongodb://localhost:27017
 MONGO_DB_NAME=btc_arbitrage
 
-# Trading
-ENABLE_TRADING=0  # Set to 1 to enable actual trading
+# Trading — set to 1 to enable live order placement
+ENABLE_TRADING=0
 DEFAULT_QUANTITY=10
-
-# Logging
-LOG_DIR=./logs
-ENABLE_JSON_LOGS=1
-LOG_LEVEL=info
 
 # Risk controls
 MAX_DAILY_TRADES=100
 MAX_POSITION_SIZE=1000
 
-# Data freshness
-MAX_DATA_AGE_MS=5000
-CANCEL_BEFORE_END_TIME_MS=10000
+# Volatility filter — abort if UP/DOWN price range over history exceeds this (default: 0.05)
+MAX_PRICE_VOLATILITY=0.05
 
-# Polymarket Wallet Configuration (REQUIRED for trading)
-POLY_PRIVATE_KEY=your_private_key_here  # EOA private key (with or without 0x prefix)
-POLY_WALLET_TYPE=0  # 0=EOA (main wallet), 1=proxy, 2=proxy type 2
-POLY_FUNDER=your_proxy_wallet_address  # Required if using proxy wallet (POLY_WALLET_TYPE=1 or 2)
-POLY_RPC_URL=https://polygon-rpc.com  # Polygon RPC endpoint (can use Infura, Alchemy, etc.)
+# Minimum history snapshots before volatility/slippage filters activate (default: 10)
+MIN_HISTORY_FOR_FILTER=10
 
-# Polymarket Exchange Contract Address (OPTIONAL - defaults to correct address)
-# IMPORTANT: This is the Polymarket Exchange SMART CONTRACT address, NOT your wallet address
-# It's the contract that needs approval to spend your USDC
-# Default: 0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E (from py-clob-client)
-# Only set this if you need to override the default
-# POLYMARKET_EXCHANGE_ADDRESS=0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E
+# Polymarket wallet (REQUIRED for trading)
+POLY_PRIVATE_KEY=your_private_key_here
+POLY_WALLET_TYPE=0       # 0=EOA, 1=proxy, 2=proxy type 2
+POLY_RPC_URL=https://polygon-rpc.com
+
+# Polygon RPC — use Alchemy/Infura for reliability
+# POLY_RPC_URL=https://polygon-mainnet.g.alchemy.com/v2/YOUR_KEY
 ```
+
+See `.env.example` for the full list of variables with documentation.
 
 ## Usage
 
-### Run the bot
+### Observation mode (no trading)
 
 ```bash
-npm start
+ENABLE_TRADING=0 npm start
 # or
 npm run dev
 ```
 
-### Run simulation
+### Live trading
+
+```bash
+ENABLE_TRADING=1 npm start
+```
+
+### Simulation / backtesting
 
 ```bash
 npm run simulate
 ```
+
+### Leg-risk verification suite
+
+Runs 24 assertions across 5 scenarios covering both-filled, neither-filled, up-only-filled, down-only-filled, and the `UnwindFailedError` halt path:
+
+```bash
+npx ts-node src/test-leg-risk.ts
+```
+
+All 24 assertions must pass before deploying to live trading.
 
 ## Architecture
 
 ```
 src/
 ├── clients/
-│   └── polymarket.ts          # Polymarket API client
+│   ├── polymarket.ts          # Polymarket REST API client
+│   └── clob-client.ts         # CLOB order placement (buy + sell/unwind)
 ├── services/
 │   ├── arbitrage-orchestrator.ts  # Main orchestrator
-│   ├── market-data-manager.ts     # WebSocket market data manager
-│   ├── arbitrage-detector.ts      # Arbitrage detection engine
-│   ├── trade-executor.ts          # Atomic trade execution
-│   ├── database.ts                # MongoDB service
+│   ├── market-data-manager.ts     # WebSocket + price history ring buffer
+│   ├── arbitrage-detector.ts      # Arbitrage detection, volatility filter,
+│   │                              #   dynamic slippage estimation
+│   ├── trade-executor.ts          # Zero Naked Exposure execution engine
+│   │                              #   (FOK entry + FAK unwind + halt logic)
+│   ├── database.ts                # MongoDB service (throttled writes)
 │   ├── json-logger.ts             # JSON log file system
 │   └── simulation-engine.ts       # Backtesting engine
-├── types.ts                       # Type definitions
+├── types.ts                       # Type definitions (incl. partial_unwind status)
 ├── config.ts                      # Configuration
 ├── utils/
 │   ├── logger.ts                  # Logging utilities
 │   └── retry.ts                   # Retry logic
 ├── index.ts                       # Main entry point
-└── simulate.ts                    # Simulation entry point
+├── simulate.ts                    # Simulation entry point
+└── test-leg-risk.ts               # 24-assertion leg-risk verification suite
 ```
 
 ## MongoDB Schemas
 
 ### Trade Record
+
 ```typescript
 {
   timestamp: number;
   market5_id: string;
   market15_id: string;
-  direction: { upMarket: "5m" | "15m", downMarket: "5m" | "15m" };
+  direction: { upMarket: "5m" | "15m"; downMarket: "5m" | "15m" };
   price_up: number;
   price_down: number;
   sum_price: number;
   quantity: number;
   latency_ms: number;
-  status: "filled" | "canceled" | "failed";
+  status: "filled" | "canceled" | "failed" | "partial_unwind";
+  up_order_id?: string;
+  down_order_id?: string;
+  unwind_order_id?: string;   // set on partial_unwind records
   pnl_estimate: number;
+  error?: string;
 }
 ```
 
+> **Important:** Records with `status: "partial_unwind"` indicate the bot halted after a failed or successful unwind. Review these manually before restarting live trading.
+
 ### Market Data Record
+
 ```typescript
 {
   market_id: string;
@@ -167,7 +255,7 @@ src/
   beat_price: number;
   final_finish_price: number | null;
   result: "UP" | "DOWN" | "PENDING";
-  price_timeline: PriceSnapshot[];
+  price_timeline: PriceSnapshot[];  // last 60 snapshots (~30 seconds)
 }
 ```
 
@@ -184,40 +272,33 @@ Sum: 0.87
 Timestamp: 2024-01-01T12:00:00Z
 ```
 
+A `[CRITICAL]` log line followed by bot shutdown indicates an `UnwindFailedError` — a naked position may exist. Check MongoDB for the `partial_unwind` record.
+
 ### JSON Log Files
 
 One JSON log per market pair containing:
 - Beat prices
 - Detected direction
-- Trade attempts
-- Execution results
+- Trade attempts and execution results
+- Slippage estimates used
 - Final resolution outcome
 - Realized PnL
 
 ## Risk Controls
 
-- **Daily trade limit**: Maximum trades per day
-- **Position sizing**: Maximum position size
-- **Stale data protection**: Rejects trades on stale data
-- **Latency monitoring**: Tracks execution latency
-- **Auto-cancel**: Cancels orders near `endTime`
+| Control | Config Variable | Default |
+|---|---|---|
+| Daily trade limit | `MAX_DAILY_TRADES` | 100 |
+| Max position size | `MAX_POSITION_SIZE` | 1000 USDC |
+| Stale data rejection | `MAX_DATA_AGE_MS` | 5000 ms |
+| Pre-expiry cancel window | `CANCEL_BEFORE_END_TIME_MS` | 10000 ms |
+| Volatility gate | `MAX_PRICE_VOLATILITY` | 0.05 |
+| Min history for filters | `MIN_HISTORY_FOR_FILTER` | 10 snapshots |
+| Slippage floor | `MAX_SLIPPAGE` | 0.02 (2%) |
 
-## Simulation/Backtesting
+## Wallet Setup
 
-The simulation engine:
-- Reads historical market JSON logs
-- Replays beat prices, token prices, and `endTime` events
-- Runs the same arbitrage logic
-- Outputs:
-  - Total trades
-  - Win rate
-  - PnL curve
-  - Max drawdown
-  - Latency sensitivity
-
-## Wallet Approval
-
-The bot implements proper EOA (Externally Owned Account) wallet approval:
+The bot implements proper EOA wallet approval on startup:
 
 1. **On-chain USDC approval**: Grants the Polymarket exchange contract permission to spend USDC
 2. **API balance allowance**: Updates CLOB API with current allowances
@@ -225,16 +306,20 @@ The bot implements proper EOA (Externally Owned Account) wallet approval:
 
 The approval process runs automatically on bot startup if `ENABLE_TRADING=1`.
 
-## Production Considerations
+Supported wallet types (`POLY_WALLET_TYPE`):
+- `0` — EOA (standard private-key wallet, most common)
+- `1` — Proxy wallet (type 1)
+- `2` — Proxy wallet (type 2)
 
-- ✅ EOA wallet approval implemented
-- ✅ CLOB API integration for order placement
-- ✅ Proper error handling and recovery
-- Set up monitoring and alerting
-- Configure proper MongoDB indexes
-- Implement rate limiting for API calls
-- Add circuit breakers for market volatility
-- Verify contract addresses are up-to-date
+## Production Checklist
+
+- [ ] Run `npx ts-node src/test-leg-risk.ts` — all 24 assertions must pass
+- [ ] Start in observation mode (`ENABLE_TRADING=0`) and verify beat prices load correctly
+- [ ] Confirm MongoDB is running and `btc_arbitrage` database is accessible
+- [ ] Set `POLY_RPC_URL` to a reliable Alchemy/Infura endpoint (not public RPC)
+- [ ] Review `MAX_PRICE_VOLATILITY` and `MAX_SLIPPAGE` for current market conditions
+- [ ] Set `ENABLE_TRADING=1` and `DEFAULT_QUANTITY` to your desired position size
+- [ ] Monitor logs for any `partial_unwind` records after first live session
 
 ## License
 
