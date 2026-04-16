@@ -12,6 +12,7 @@
  * halt the bot. A naked position must never be silently ignored.
  */
 
+import { randomUUID } from "crypto";
 import type { TradeParams, TradeExecution, TradeStatus } from "../types";
 import { logInfo, logError, logWarn, logDebug } from "../utils/logger";
 import { getConfig } from "../config";
@@ -24,7 +25,7 @@ import { ClobClient } from "../clients/clob-client";
 const UNWIND_SELL_PRICE = 0.01;
 
 function generateUUID(): string {
-  return `${Date.now()}-${Math.random().toString(36).substr(2, 9)}-${Math.random().toString(36).substr(2, 9)}`;
+  return randomUUID();
 }
 
 /**
@@ -134,6 +135,16 @@ export class TradeExecutor {
       ]);
 
       const latency = Date.now() - startTime;
+
+      // Batch response validation: a length mismatch (handled by placeBatchOrders)
+      // returns error objects for all slots, so we always get exactly 2 entries.
+      // Guard here as a belt-and-suspenders check.
+      if (results.length !== 2) {
+        logError(`[${tradeId}] Unexpected batch result count: ${results.length}; treating as failed`);
+        return this.buildExecution(tradeId, params, latency, "failed", undefined, undefined,
+          `Unexpected batch result count: ${results.length}`);
+      }
+
       const upResult = results[0];
       const downResult = results[1];
 
@@ -156,7 +167,8 @@ export class TradeExecutor {
       // ── Both legs filled ──────────────────────────────────────────────────
       if (upFilled && downFilled) {
         logInfo(`[${tradeId}] Both legs filled — clean arbitrage.`);
-        return this.buildExecution(tradeId, params, latency, "filled", upOrderId, downOrderId);
+        return this.buildExecution(tradeId, params, latency, "filled", upOrderId, downOrderId,
+          undefined, undefined, "matched", "matched");
       }
 
       // ── Neither leg filled ────────────────────────────────────────────────
@@ -165,7 +177,8 @@ export class TradeExecutor {
           `UP: ${upResult?.error ?? upResult?.status ?? "unmatched"}, ` +
           `DOWN: ${downResult?.error ?? downResult?.status ?? "unmatched"}`;
         logInfo(`[${tradeId}] Neither leg filled — clean miss. ${reason}`);
-        return this.buildExecution(tradeId, params, latency, "failed", upOrderId, downOrderId, reason);
+        return this.buildExecution(tradeId, params, latency, "failed", upOrderId, downOrderId, reason,
+          undefined, upResult?.status ?? "unmatched", downResult?.status ?? "unmatched");
       }
 
       // ── Partial fill — one leg filled, one missed ─────────────────────────
@@ -267,7 +280,8 @@ export class TradeExecutor {
 
     // A FAK SELL at $0.01 should match against all bids in any liquid market.
     // If the status is not "matched", there are genuinely no bids — halt required.
-    if (response.status !== "matched" && response.status !== "MATCHED") {
+    // Use case-insensitive comparison to guard against API casing drift.
+    if (response.status?.toLowerCase() !== "matched") {
       return {
         success: false,
         orderId: response.orderID,
@@ -290,6 +304,8 @@ export class TradeExecutor {
     downOrderId?: string,
     error?: string,
     unwindOrderId?: string,
+    upLegStatus?: string,
+    downLegStatus?: string,
   ): TradeExecution {
     const sumPrice = params.upPrice + params.downPrice;
     const pnlEstimate = 1.0 - sumPrice;
@@ -313,8 +329,9 @@ export class TradeExecutor {
       status,
       upOrderId,
       downOrderId,
-      upOrderStatus: status,
-      downOrderStatus: status,
+      // Per-leg statuses reflect individual API outcomes, not the overall trade status
+      upOrderStatus: upLegStatus ?? status,
+      downOrderStatus: downLegStatus ?? status,
       unwindOrderId,
       error,
       pnlEstimate,

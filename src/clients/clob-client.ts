@@ -189,9 +189,7 @@ export class ClobClient {
       const response = await fetch(url);
 
       if (!response.ok) {
-        logWarn(`Failed to fetch nonce: ${response.status}, using 0 as fallback`);
-        this.nonce = 0;
-        return 0;
+        throw new Error(`Failed to fetch exchange nonce: HTTP ${response.status}`);
       }
 
       const data = (await response.json()) as { nonce?: number; nonce_value?: number };
@@ -199,9 +197,7 @@ export class ClobClient {
       logDebug(`Fetched exchange nonce: ${this.nonce}`);
       return this.nonce;
     } catch (error) {
-      logWarn(`Error fetching nonce: ${error instanceof Error ? error.message : String(error)}, using 0 as fallback`);
-      this.nonce = 0;
-      return 0;
+      throw new Error(`Failed to fetch exchange nonce: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
 
@@ -440,7 +436,7 @@ export class ClobClient {
     await this.updateBalanceAllowance("CONDITIONAL");
 
     logInfo("Approval process completed");
-    return true;
+    return onChainSuccess;
   }
 
   /**
@@ -463,61 +459,82 @@ export class ClobClient {
     const signer = this.wallet.address; // Signer is always the wallet
     const taker = "0x0000000000000000000000000000000000000000"; // Zero address for open orders
 
-    // Calculate amounts in wei
-    // For BUY orders:
-    // - makerAmount = size * price (in USDC, 6 decimals) = (size * price) * 1e6
-    // - takerAmount = size (in shares, 18 decimals) = size * 1e18
-    // For SELL orders (reverse):
-    // - makerAmount = size (in shares, 18 decimals) = size * 1e18
-    // - takerAmount = size * price (in USDC, 6 decimals) = (size * price) * 1e6
-    
-    const USDC_DECIMALS = 6;
-    const SHARE_DECIMALS = 18;
-    
+    // Safe BigInt wei conversion — avoids IEEE-754 precision loss at size >= 9.
+    // Callers have already rounded price to 4dp and size to 2dp, so:
+    //   priceMicro  = price * 1e4  (exact integer)
+    //   sizeHundreds = size * 1e2  (exact integer)
+    //
+    // BUY:  makerAmount (USDC, 6dp) = price * size * 1e6
+    //         = (priceMicro/1e4) * (sizeHundreds/1e2) * 1e6
+    //         = priceMicro * sizeHundreds              (units cancel)
+    //       takerAmount (shares, 18dp) = size * 1e18
+    //         = (sizeHundreds/1e2) * 1e18
+    //         = sizeHundreds * 1e16
+    // SELL: directions reversed.
+    const priceMicro   = BigInt(Math.round(args.price * 1e4));
+    const sizeHundreds = BigInt(Math.round(args.size  * 1e2));
+    const SHARE_MULTIPLIER = BigInt("10000000000000000"); // 1e16
+
     let makerAmount: bigint;
     let takerAmount: bigint;
-    
+
     if (args.side === "BUY") {
-      // Maker pays USDC, receives shares
-      makerAmount = BigInt(Math.floor(args.size * args.price * 10 ** USDC_DECIMALS));
-      takerAmount = BigInt(Math.floor(args.size * 10 ** SHARE_DECIMALS));
+      makerAmount = priceMicro * sizeHundreds;          // USDC (6dp)
+      takerAmount = sizeHundreds * SHARE_MULTIPLIER;    // shares (18dp)
     } else {
-      // Maker pays shares, receives USDC
-      makerAmount = BigInt(Math.floor(args.size * 10 ** SHARE_DECIMALS));
-      takerAmount = BigInt(Math.floor(args.size * args.price * 10 ** USDC_DECIMALS));
+      makerAmount = sizeHundreds * SHARE_MULTIPLIER;    // shares (18dp)
+      takerAmount = priceMicro * sizeHundreds;          // USDC (6dp)
     }
 
-    // L1 Method: Sign order using EIP-712 typed data signing
-    // According to https://docs.polymarket.com/developers/CLOB/clients/methods-l1
-    // Orders are signed as EIP-712 typed data, not plain JSON
-    // The signature format matches the official CLOB client implementation
-    
-    // Build typed data structure for EIP-712 signing
-    // Note: Polymarket uses a specific domain separator and order structure
-    // For EOA (signatureType 0), we use standard EIP-712 signing
-    // Convert all numeric fields to strings for signing (per py-clob-client format)
-    const orderForSigning = {
-      salt: salt.toString(),
+    const expiration = args.expiration || 0;
+    const nonce = (this.nonce ?? 0) as number;
+    const side = args.side === "BUY" ? 0 : 1; // 0=BUY, 1=SELL per contract
+
+    // EIP-712 typed-data signing — matches the Polymarket CTFExchange contract.
+    // The contract verifies ecrecover against a domain-separated EIP-712 hash.
+    // EIP-191 personal_sign (signMessage) produces a different hash and will be
+    // rejected by the exchange with a signature validation error.
+    const domain = {
+      name: "CTFExchange",
+      version: "1",
+      chainId: CHAIN_ID,
+      verifyingContract: (POLYMARKET_CONTRACTS.exchange ?? DEFAULT_EXCHANGE_ADDRESS) as string,
+    };
+
+    const types = {
+      Order: [
+        { name: "salt",          type: "uint256" },
+        { name: "maker",         type: "address" },
+        { name: "signer",        type: "address" },
+        { name: "taker",         type: "address" },
+        { name: "tokenId",       type: "uint256" },
+        { name: "makerAmount",   type: "uint256" },
+        { name: "takerAmount",   type: "uint256" },
+        { name: "expiration",    type: "uint256" },
+        { name: "nonce",         type: "uint256" },
+        { name: "feeRateBps",    type: "uint256" },
+        { name: "side",          type: "uint8"   },
+        { name: "signatureType", type: "uint8"   },
+      ],
+    };
+
+    const orderValue = {
+      salt:          BigInt(salt),
       maker,
       signer,
       taker,
-      tokenId: args.tokenId,
-      makerAmount: makerAmount.toString(),
-      takerAmount: takerAmount.toString(),
-      expiration: (args.expiration || 0).toString(),
-      nonce: ((this.nonce ?? 0) as number).toString(),
-      feeRateBps: "0",
-      side: args.side === "BUY" ? 0 : 1, // 0 = BUY, 1 = SELL per API
+      tokenId:       BigInt(args.tokenId),
+      makerAmount,
+      takerAmount,
+      expiration:    BigInt(expiration),
+      nonce:         BigInt(nonce),
+      feeRateBps:    BigInt(0),
+      side,
       signatureType: this.signatureType,
     };
-    
-    // Sign using EIP-712 typed data (if available) or fallback to JSON string signing
-    // The official client uses EIP-712, but for compatibility we'll use the same format
-    // that py-clob-client uses (JSON string signing for EOA)
-    const message = JSON.stringify(orderForSigning);
-    const signature = await this.wallet.signMessage(ethers.toUtf8Bytes(message));
 
-    // Return full order object (with numbers as per API spec)
+    const signature = await this.wallet.signTypedData(domain, types, orderValue);
+
     return {
       salt,
       maker,
@@ -526,9 +543,9 @@ export class ClobClient {
       tokenId: args.tokenId,
       makerAmount: makerAmount.toString(),
       takerAmount: takerAmount.toString(),
-      expiration: (args.expiration || 0).toString(),
-      nonce: ((this.nonce ?? 0) as number).toString(),
-      feeRateBps: "0", // TODO: Make configurable via environment variable
+      expiration: expiration.toString(),
+      nonce: nonce.toString(),
+      feeRateBps: "0",
       side: args.side,
       signatureType: this.signatureType,
       signature,
@@ -761,44 +778,47 @@ export class ClobClient {
     }
 
     try {
-      // Create all orders
-      const postOrders: PostOrderPayload[] = await Promise.all(
-        orders.map(async (orderArgs) => {
-          // Round price and size
-          const roundedPrice = Math.round(orderArgs.price * 10000) / 10000;
-          let roundedSize = Math.round(orderArgs.size * 100) / 100;
+      // Update conditional token allowances for all tokens in the batch
+      await Promise.all(orders.map((o) => this.updateBalanceAllowance("CONDITIONAL", o.tokenId)));
 
-          // Ensure minimum order value
-          if (roundedPrice * roundedSize < 1.0) {
-            roundedSize = Math.ceil((1.0 / roundedPrice) * 100) / 100;
-          }
+      // Build orders SEQUENTIALLY — each createOrder reads this.nonce, so concurrent
+      // calls would assign the same nonce to both orders, causing the second to be
+      // rejected by the exchange with a nonce-mismatch error.
+      const postOrders: PostOrderPayload[] = [];
+      for (const orderArgs of orders) {
+        const roundedPrice = Math.round(orderArgs.price * 10000) / 10000;
+        let roundedSize = Math.round(orderArgs.size * 100) / 100;
 
-          // Ensure maker amount has <= 2 decimals
-          while (this.decimalPlaces(roundedPrice * roundedSize) > 2) {
-            roundedSize = Math.round((roundedSize + 0.01) * 100) / 100;
-          }
+        // Ensure minimum order value
+        if (roundedPrice * roundedSize < 1.0) {
+          roundedSize = Math.ceil((1.0 / roundedPrice) * 100) / 100;
+        }
 
-          const order = await this.createOrder({
-            price: roundedPrice,
-            size: roundedSize,
-            side: orderArgs.side,
-            tokenId: orderArgs.tokenId,
-            expiration: orderArgs.expiration || 0,
-          });
+        // Ensure maker amount has <= 2 decimals
+        while (this.decimalPlaces(roundedPrice * roundedSize) > 2) {
+          roundedSize = Math.round((roundedSize + 0.01) * 100) / 100;
+        }
 
-          const postOrder: PostOrderPayload = {
-            order,
-            orderType: orderArgs.orderType,
-            postOnly: false,
-          };
+        const order = await this.createOrder({
+          price: roundedPrice,
+          size: roundedSize,
+          side: orderArgs.side,
+          tokenId: orderArgs.tokenId,
+          expiration: orderArgs.expiration || 0,
+        });
+        // Eagerly increment nonce so the next order in the loop gets nonce+1
+        this.incrementNonce();
 
-          if (this.apiKey) {
-            postOrder.owner = this.apiKey;
-          }
-
-          return postOrder;
-        }),
-      );
+        const postOrder: PostOrderPayload = {
+          order,
+          orderType: orderArgs.orderType,
+          postOnly: false,
+        };
+        if (this.apiKey) {
+          postOrder.owner = this.apiKey;
+        }
+        postOrders.push(postOrder);
+      }
 
       // Post batch to CLOB API
       const url = `${CLOB_HOST}/orders`; // Note: plural "orders" for batch
@@ -826,6 +846,18 @@ export class ClobClient {
         [key: string]: unknown;
       }>;
 
+      // Validate the API returned one result per submitted order.
+      // A length mismatch means a result is missing and index-based leg assignment
+      // (UP=results[0], DOWN=results[1]) would be wrong, potentially targeting the
+      // wrong token during an emergency unwind.
+      if (results.length !== orders.length) {
+        logError(
+          `Batch response length mismatch: submitted ${orders.length} orders, ` +
+          `received ${results.length} results — cannot safely assign legs`,
+        );
+        return orders.map(() => ({ error: "Batch response length mismatch" }));
+      }
+
       const mappedResults = results.map((result) => {
         if (result.success === false || result.errorMsg) {
           return {
@@ -840,12 +872,7 @@ export class ClobClient {
         };
       });
 
-      // Increment nonce for each successful order
-      const successCount = mappedResults.filter((r) => !r.error).length;
-      for (let i = 0; i < successCount; i++) {
-        this.incrementNonce();
-      }
-
+      // Nonces are already incremented eagerly during order creation above.
       return mappedResults;
     } catch (error) {
       logError("Failed to place batch orders:", error);
@@ -913,9 +940,10 @@ export class ClobClient {
    * Helper: Get decimal places in a number
    */
   private decimalPlaces(x: number): number {
-    const s = x.toString();
-    if (s.includes("e")) return 0;
+    // Use toFixed(20) to avoid scientific notation (e.g. 1e-7 serialises as "1e-7"
+    // with .toString(), which would incorrectly return 0 decimal places)
+    const s = Number(x).toFixed(20).replace(/0+$/, "");
     if (!s.includes(".")) return 0;
-    return s.split(".")[1]?.replace(/0+$/, "").length || 0;
+    return s.split(".")[1]?.length || 0;
   }
 }

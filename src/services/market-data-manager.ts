@@ -346,7 +346,10 @@ export class MarketDataManager {
     wsState.pongCheckInterval = setInterval(() => {
       if (wsState.ws && wsState.ws.readyState === WebSocket.OPEN) {
         const timeSinceLastPong = Date.now() - wsState.lastPongTime;
-        if (timeSinceLastPong > PONG_TIMEOUT && wsState.lastPongTime > 0) {
+        // lastPongTime is initialised to Date.now() on open, so > 0 is always true.
+        // The old "&& lastPongTime > 0" guard was masking the ws.send("ping") bug —
+        // pong events never fired because data frames don't elicit pong responses.
+        if (timeSinceLastPong > PONG_TIMEOUT) {
           logWarn(`${marketType} WebSocket: No pong received for ${Math.floor(timeSinceLastPong / 1000)}s, closing connection for reconnect`);
           wsState.ws.close();
         }
@@ -357,7 +360,10 @@ export class MarketDataManager {
       if (wsState.ws && wsState.ws.readyState === WebSocket.OPEN) {
         // Send PING as plain text, not JSON (some servers expect plain "ping")
         try {
-          wsState.ws.send("ping");
+          // ws.ping() sends a WebSocket-level PING frame (RFC 6455 §5.5.2).
+          // ws.send("ping") sends a data frame — the server's "pong" event
+          // only fires in response to a real PING frame, not a data frame.
+          wsState.ws.ping();
           logDebug(`Sent PING to ${marketType} WebSocket to keep connection alive`);
         } catch (error) {
           logError(`Failed to send PING to ${marketType} WebSocket:`, error);
@@ -527,7 +533,10 @@ export class MarketDataManager {
     }
     
     const startTime = startTimestamp || 0;
-    const endTime = new Date(event.endDate).getTime() / 1000;
+    // Use Math.floor so endTime is always an integer Unix timestamp.
+    // A sub-second endDate (e.g. "...T12:05:00.500Z") would produce a float,
+    // causing the === endTime sync-check to fail intermittently.
+    const endTime = Math.floor(new Date(event.endDate).getTime() / 1000);
 
     // Get beat price from cache or fetch it
     // Beat price = Chainlink BTC/USD price at market start timestamp (FIXED - never changes)
@@ -617,55 +626,43 @@ export class MarketDataManager {
     // Set up message handlers for UP token (on the appropriate WebSocket)
     wsState.messageHandlers.set(market.tokens.upTokenId, (data) => {
       if (data && typeof data === "object") {
-        // Handle orderbook updates (from "book" event)
+        // "book" event — full orderbook snapshot; extract best ask as executable buy price
         if ("bids" in data && "asks" in data) {
           const orderbook = data as OrderBook;
           this.updateMarketOrderBook(market.marketId, "up", orderbook);
         }
-        // Handle price updates (from "price_change" or "best_bid_ask" events)
-        // New schema: price_change includes best_bid and best_ask in each change
+        // "price_change" / "best_bid_ask" events — best_ask is the live executable buy price
         else if ("best_bid" in data && "best_ask" in data) {
           const priceData = data as { best_bid: number; best_ask: number; price?: number; side?: string };
-          // Use best_ask as executable buy price, best_bid as executable sell price
-          // For arbitrage, we need buy price, so use best_ask
-          // If best_ask is 0 or invalid, fall back to the trade price if available
-          const executablePrice = priceData.best_ask > 0 ? priceData.best_ask : (priceData.price || 0);
+          const executablePrice = priceData.best_ask > 0 ? priceData.best_ask : 0;
           if (executablePrice > 0) {
             this.updateMarketPrice(market.marketId, "up", executablePrice);
           }
         }
-        // Handle trade price (from "last_trade_price" event)
-        else if ("price" in data && typeof (data as { price: number }).price === "number") {
-          const price = (data as { price: number }).price;
-          this.updateMarketPrice(market.marketId, "up", price);
-        }
+        // NOTE: "last_trade_price" events are intentionally NOT handled here.
+        // A last-trade price is a historical execution price (could be a sell at bid),
+        // not the current best ask. Using it as the executable buy price would
+        // underestimate costs and trigger false arb signals.
       }
     });
 
     // Set up message handlers for DOWN token (on the appropriate WebSocket)
     wsState.messageHandlers.set(market.tokens.downTokenId, (data) => {
       if (data && typeof data === "object") {
-        // Handle orderbook updates (from "book" event)
+        // "book" event — full orderbook snapshot
         if ("bids" in data && "asks" in data) {
           const orderbook = data as OrderBook;
           this.updateMarketOrderBook(market.marketId, "down", orderbook);
         }
-        // Handle price updates (from "price_change" or "best_bid_ask" events)
-        // New schema: price_change includes best_bid and best_ask in each change
+        // "price_change" / "best_bid_ask" events
         else if ("best_bid" in data && "best_ask" in data) {
           const priceData = data as { best_bid: number; best_ask: number; price?: number; side?: string };
-          // Use best_ask as executable buy price
-          // If best_ask is 0 or invalid, fall back to the trade price if available
-          const executablePrice = priceData.best_ask > 0 ? priceData.best_ask : (priceData.price || 0);
+          const executablePrice = priceData.best_ask > 0 ? priceData.best_ask : 0;
           if (executablePrice > 0) {
             this.updateMarketPrice(market.marketId, "down", executablePrice);
           }
         }
-        // Handle trade price (from "last_trade_price" event)
-        else if ("price" in data && typeof (data as { price: number }).price === "number") {
-          const price = (data as { price: number }).price;
-          this.updateMarketPrice(market.marketId, "down", price);
-        }
+        // NOTE: "last_trade_price" intentionally not handled — see UP token comment.
       }
     });
 
@@ -694,18 +691,21 @@ export class MarketDataManager {
       source: "websocket",
     });
 
-    // Keep only last 1000 price snapshots
-    if (market.priceHistory.length > 1000) {
-      market.priceHistory = market.priceHistory.slice(-1000);
+    // Keep rolling 60-entry buffer (~30 seconds at 2 ticks/sec per token).
+    // Must match the cap in updateMarketOrderBook so the volatility filter and
+    // slippage estimator always see a consistent window.
+    if (market.priceHistory.length > 60) {
+      market.priceHistory = market.priceHistory.slice(-60);
     }
 
     this.marketCache.set(marketId, market);
 
-    // Log real-time prices
+    // Log real-time prices (throttled internally)
     this.logMarketPrices(market);
 
-    // Check for sync
-    this.checkSync(market);
+    // Do NOT call checkSync here — it fires onSyncDetected on every WebSocket tick,
+    // causing a thundering herd of concurrent processSynchronizedMarkets calls.
+    // Sync detection is handled by the 1-second monitoringLoop via getSynchronizedMarkets().
 
     if (this.callbacks.onMarketDataUpdate) {
       this.callbacks.onMarketDataUpdate(market.marketType, market);
@@ -751,13 +751,12 @@ export class MarketDataManager {
     }
 
     this.marketCache.set(marketId, market);
-    
-    // Log real-time prices
+
+    // Log real-time prices (throttled internally)
     this.logMarketPrices(market);
-    
-    // Check for sync and notify callbacks
-    this.checkSync(market);
-    
+
+    // Do NOT call checkSync here — see comment in updateMarketPrice.
+
     if (this.callbacks.onMarketDataUpdate) {
       this.callbacks.onMarketDataUpdate(market.marketType, market);
     }

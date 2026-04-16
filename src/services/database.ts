@@ -13,6 +13,7 @@ export class DatabaseService {
   private tradesCollection: Collection<TradeRecord> | null = null;
   private marketsCollection: Collection<MarketDataRecord> | null = null;
   private isConnected = false;
+  private isConnecting = false; // mutex: prevents concurrent connect() calls
   private connectionCheckInterval: NodeJS.Timeout | null = null;
 
   /**
@@ -21,6 +22,32 @@ export class DatabaseService {
   async connect(): Promise<void> {
     if (this.isConnected && this.db) {
       return;
+    }
+    // Mutex: if a connect() is already in progress (e.g. from ensureConnection
+    // and the health-check interval firing simultaneously), wait for it to finish
+    // rather than spawning a second MongoClient.
+    if (this.isConnecting) {
+      logDebug("MongoDB connect already in progress, skipping duplicate call");
+      return;
+    }
+    this.isConnecting = true;
+
+    // Close any existing stale client before creating a new one to prevent
+    // abandoned connection-pool leaks on repeated reconnect cycles.
+    if (this.client) {
+      try {
+        await this.client.close(true);
+      } catch {
+        // ignore close errors — we're creating a fresh client regardless
+      }
+      this.client = null;
+    }
+
+    // Clear existing health-check interval before starting a new one to prevent
+    // the interval count from doubling on every reconnect (reconnect storm).
+    if (this.connectionCheckInterval) {
+      clearInterval(this.connectionCheckInterval);
+      this.connectionCheckInterval = null;
     }
 
     const config = getConfig();
@@ -46,11 +73,13 @@ export class DatabaseService {
       await this.marketsCollection.createIndex({ market_id: 1 }, { unique: true });
 
       this.isConnected = true;
+      this.isConnecting = false;
       logInfo("Connected to MongoDB");
-      
+
       // Start connection health check
       this.startConnectionHealthCheck();
     } catch (error) {
+      this.isConnecting = false;
       logError("Failed to connect to MongoDB:", error);
       throw error;
     }

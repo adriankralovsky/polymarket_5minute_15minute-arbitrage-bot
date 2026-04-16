@@ -23,6 +23,7 @@ export class ArbitrageOrchestrator {
   private jsonLogger: JsonLogger;
   private config = getConfig();
   private isRunning = false;
+  private isProcessingArb = false; // re-entrancy guard for processSynchronizedMarkets
   private monitoringInterval: NodeJS.Timeout | null = null;
   private dailyTradeCount = 0;
   private lastTradeDate = new Date().toDateString();
@@ -180,23 +181,28 @@ export class ArbitrageOrchestrator {
         this.lastTradeDate = currentDate;
       }
 
-      // Check if markets need to be switched (window rollover)
-      // This ensures we're always targeting CURRENT markets, not old ones
+      // Check if markets need to be switched (window rollover).
+      // Defer if a trade is in-flight: the rollover would null out market refs that
+      // the in-progress executeArbitrageTrade may still be referencing.
       if (this.shouldSwitchMarkets()) {
-        logInfo("Window rollover detected, switching to current markets");
-        
-        // Unsubscribe from old markets
-        const oldMarkets5m = this.marketDataManager.getMarketsByType("5m");
-        const oldMarkets15m = this.marketDataManager.getMarketsByType("15m");
-        
-        for (const market of [...oldMarkets5m, ...oldMarkets15m]) {
-          const assetIds = [market.tokens.upTokenId, market.tokens.downTokenId];
-          this.marketDataManager.unsubscribeFromMarket(market.marketId);
-          logInfo(`Unsubscribed from old market ${market.marketId} (assets: ${assetIds.join(", ")})`);
+        if (this.isProcessingArb) {
+          logDebug("Window rollover deferred — arb execution in flight");
+        } else {
+          logInfo("Window rollover detected, switching to current markets");
+
+          // Unsubscribe from old markets
+          const oldMarkets5m = this.marketDataManager.getMarketsByType("5m");
+          const oldMarkets15m = this.marketDataManager.getMarketsByType("15m");
+
+          for (const market of [...oldMarkets5m, ...oldMarkets15m]) {
+            const assetIds = [market.tokens.upTokenId, market.tokens.downTokenId];
+            this.marketDataManager.unsubscribeFromMarket(market.marketId);
+            logInfo(`Unsubscribed from old market ${market.marketId} (assets: ${assetIds.join(", ")})`);
+          }
+
+          // Initialize new current markets
+          await this.initializeMarkets();
         }
-        
-        // Initialize new current markets
-        await this.initializeMarkets();
       }
 
       // Check for synchronized markets
@@ -252,9 +258,27 @@ export class ArbitrageOrchestrator {
   }
 
   /**
-   * Process synchronized markets for arbitrage
+   * Process synchronized markets for arbitrage.
+   *
+   * Re-entrancy guard: this method is called from both the 1-second monitoring
+   * loop and the WebSocket onSyncDetected callback. Without the guard, dozens of
+   * concurrent executions can fire before the first order settles, causing
+   * duplicate trades for the same opportunity.
    */
   private async processSynchronizedMarkets(market5m: MarketData, market15m: MarketData): Promise<void> {
+    if (this.isProcessingArb) {
+      logDebug("Arb check skipped — previous execution still in flight");
+      return;
+    }
+    this.isProcessingArb = true;
+    try {
+      await this._doProcessSynchronizedMarkets(market5m, market15m);
+    } finally {
+      this.isProcessingArb = false;
+    }
+  }
+
+  private async _doProcessSynchronizedMarkets(market5m: MarketData, market15m: MarketData): Promise<void> {
     // Validate data freshness
     if (this.marketDataManager.isDataStale(market5m) || this.marketDataManager.isDataStale(market15m)) {
       logWarn("Stale data detected, skipping arbitrage check");

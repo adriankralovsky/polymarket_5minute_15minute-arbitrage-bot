@@ -41,15 +41,22 @@ export class JsonLogger {
 
   constructor() {
     this.logDir = this.config.logDir;
-    this.ensureLogDir();
+    if (this.config.enableJsonLogs) {
+      this.ensureLogDir();
+    }
   }
 
   /**
-   * Ensure log directory exists
+   * Ensure log directory exists (only called when JSON logging is enabled)
    */
   private ensureLogDir(): void {
-    if (!fs.existsSync(this.logDir)) {
-      fs.mkdirSync(this.logDir, { recursive: true });
+    try {
+      if (!fs.existsSync(this.logDir)) {
+        fs.mkdirSync(this.logDir, { recursive: true });
+      }
+    } catch (error) {
+      // Log the error but don't crash the bot — JSON logging is non-critical
+      logError(`Failed to create log directory "${this.logDir}":`, error);
     }
   }
 
@@ -140,48 +147,50 @@ export class JsonLogger {
   }
 
   /**
-   * Calculate realized PnL from execution results
+   * Calculate realized PnL from execution results.
+   *
+   * In a correctly executed two-leg arb we hold one UP token and one DOWN token
+   * with the same endTime. Exactly one of them pays out 1.0 USDC regardless of
+   * market direction — the other expires at 0. So the guaranteed profit on a
+   * fully filled trade is always: pnl = 1.0 - sumPrice.
+   *
+   * The previous implementation tried to figure out "which side won" and fell
+   * into a logic trap where upWon && downWon are BOTH true (one market resolved
+   * UP, the other DOWN), causing the else branch (total loss) to never fire but
+   * the positive branch to fire twice — double-counting wins.
    */
   private calculateRealizedPnL(log: MarketPairLog): number {
     if (!log.finalResolution) return 0;
 
     let totalPnL = 0;
     for (const execution of log.executionResults) {
-      if (execution.status !== "filled") continue;
-
-      // Determine which token won
-      const upWon = log.finalResolution.result5m === "UP" || log.finalResolution.result15m === "UP";
-      const downWon = log.finalResolution.result5m === "DOWN" || log.finalResolution.result15m === "DOWN";
-
-      // Calculate PnL based on which tokens were bought
-      if (execution.direction.upMarket === "5m" && upWon) {
-        totalPnL += 1.0 - execution.prices.sumPrice; // UP token pays 1.0
-      } else if (execution.direction.downMarket === "5m" && downWon) {
-        totalPnL += 1.0 - execution.prices.sumPrice; // DOWN token pays 1.0
-      } else if (execution.direction.upMarket === "15m" && upWon) {
+      if (execution.status === "filled") {
+        // Both legs filled: guaranteed payout regardless of which side won
         totalPnL += 1.0 - execution.prices.sumPrice;
-      } else if (execution.direction.downMarket === "15m" && downWon) {
-        totalPnL += 1.0 - execution.prices.sumPrice;
-      } else {
-        totalPnL -= execution.prices.sumPrice; // Lost trade
+      } else if (execution.status === "partial_unwind") {
+        // One leg was bought and then immediately sold at $0.01 to unwind.
+        // Approximate loss: the cost of the filled leg with no offsetting payout.
+        totalPnL -= execution.prices.sumPrice / 2;
       }
+      // "failed" / "canceled" = no position taken, zero PnL impact
     }
 
     return totalPnL;
   }
 
   /**
-   * Save log to JSON file
+   * Save log to JSON file (async, fire-and-forget).
+   * fs.writeFileSync blocks the entire Node.js event loop on every sync detection
+   * event, adding latency to the arb detection loop. Using the async API keeps the
+   * event loop free during disk I/O.
    */
   private saveLog(log: MarketPairLog): void {
-    try {
-      const filename = `market-pair-${log.marketPairId}-${log.endTime}.json`;
-      const filepath = path.join(this.logDir, filename);
-      fs.writeFileSync(filepath, JSON.stringify(log, null, 2));
-      logDebug(`Saved JSON log: ${filename}`);
-    } catch (error) {
+    const filename = `market-pair-${log.marketPairId}-${log.endTime}.json`;
+    const filepath = path.join(this.logDir, filename);
+    fs.promises.writeFile(filepath, JSON.stringify(log, null, 2)).catch((error) => {
       logError("Failed to save JSON log:", error);
-    }
+    });
+    logDebug(`Saving JSON log: ${filename}`);
   }
 
   /**

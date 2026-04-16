@@ -20,20 +20,30 @@ async function main(): Promise<void> {
     // Start the bot
     await orchestrator.start();
 
-    // Keep process alive
-    process.stdin.resume();
+    // Keep process alive via open handles (MongoDB + WebSocket).
+    // process.stdin.resume() is not needed and buffers stdin indefinitely.
 
-    // Handle graceful shutdown
-    process.on("SIGINT", async () => {
-      logInfo("Received SIGINT, shutting down gracefully...");
-      await orchestrator.stop();
-      process.exit(0);
-    });
+    // Graceful shutdown — shared handler to prevent double-stop on rapid signals.
+    let isShuttingDown = false;
+    const shutdown = async (signal: string): Promise<void> => {
+      if (isShuttingDown) return;
+      isShuttingDown = true;
+      logInfo(`Received ${signal}, shutting down gracefully...`);
+      try {
+        await orchestrator.stop();
+      } catch (err) {
+        logError("Error during graceful shutdown:", err);
+      } finally {
+        process.exit(0);
+      }
+    };
 
-    process.on("SIGTERM", async () => {
-      logInfo("Received SIGTERM, shutting down gracefully...");
-      await orchestrator.stop();
-      process.exit(0);
+    process.on("SIGINT",  () => { void shutdown("SIGINT");  });
+    process.on("SIGTERM", () => { void shutdown("SIGTERM"); });
+
+    // Catch unhandled promise rejections to prevent silent crashes
+    process.on("unhandledRejection", (reason) => {
+      logError("Unhandled promise rejection:", reason);
     });
   } catch (error) {
     logError("Fatal error in main:", error);
