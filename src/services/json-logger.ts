@@ -71,8 +71,8 @@ export class JsonLogger {
         startTime: Math.min(market5m.startTime, market15m.startTime),
         endTime: market5m.endTime,
         beatPrices: {
-          beat5m: market5m.beatPrice?.value || 0,
-          beat15m: market15m.beatPrice?.value || 0,
+          beat5m: market5m.beatPrice?.value ?? 0,
+          beat15m: market15m.beatPrice?.value ?? 0,
         },
         detectedDirection: null,
         tradeAttempts: [],

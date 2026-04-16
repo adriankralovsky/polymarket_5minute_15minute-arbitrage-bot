@@ -5,19 +5,42 @@
 
 import type { HistoricalMarketData, SimulationResult, ArbitrageOpportunity } from "../types";
 import { ArbitrageDetector } from "./arbitrage-detector";
-import { TradeExecutor } from "./trade-executor";
-import { logInfo, logError, logDebug } from "../utils/logger";
+import { logInfo, logDebug } from "../utils/logger";
 import { getConfig } from "../config";
-import type { MarketData } from "../types";
+import type { MarketData, TradeParams, TradeExecution } from "../types";
+
+/**
+ * Dry-run trade executor for simulation — records the opportunity without
+ * touching the CLOB API or requiring POLY_PRIVATE_KEY to be set.
+ */
+class SimulatedTradeExecutor {
+  async executeTradeBatch(params: TradeParams): Promise<TradeExecution> {
+    const sumPrice = params.upPrice + params.downPrice;
+    return {
+      tradeId:      `sim-${Date.now()}`,
+      timestamp:    Date.now(),
+      market5Id:    params.market5mId,
+      market15Id:   params.market15mId,
+      direction:    { upMarket: params.upMarket, downMarket: params.downMarket },
+      prices:       { upPrice: params.upPrice, downPrice: params.downPrice, sumPrice },
+      quantity:     params.quantity,
+      latencyMs:    0,
+      status:       "filled",
+      pnlEstimate:  1.0 - sumPrice,
+    };
+  }
+}
 
 export class SimulationEngine {
   private detector: ArbitrageDetector;
-  private executor: TradeExecutor;
+  private executor: SimulatedTradeExecutor;
   private config = getConfig();
 
   constructor() {
     this.detector = new ArbitrageDetector();
-    this.executor = new TradeExecutor();
+    // Use the dry-run executor — real TradeExecutor requires POLY_PRIVATE_KEY and
+    // would place real orders on Polymarket if ENABLE_TRADING=1 is set.
+    this.executor = new SimulatedTradeExecutor();
   }
 
   /**
@@ -55,9 +78,18 @@ export class SimulationEngine {
     let peakPnL = 0;
 
     for (const timestamp of sortedTimestamps) {
-      // Update prices at this timestamp
-      const price5m = market5m.priceHistory.find((p) => p.timestamp <= timestamp);
-      const price15m = market15m.priceHistory.find((p) => p.timestamp <= timestamp);
+      // Update prices at this timestamp.
+      // We want the most-recent snapshot whose timestamp <= current replay timestamp.
+      // Array.find returns the *first* (oldest) match on an ascending array, which
+      // would pin every price lookup to t=0. Iterate in reverse instead.
+      const findLatestAt = (history: typeof market5m.priceHistory, ts: number) => {
+        for (let i = history.length - 1; i >= 0; i--) {
+          if (history[i].timestamp <= ts) return history[i];
+        }
+        return undefined;
+      };
+      const price5m  = findLatestAt(market5m.priceHistory,  timestamp);
+      const price15m = findLatestAt(market15m.priceHistory, timestamp);
 
       if (price5m) {
         market5m.upPrice = price5m.upPrice;

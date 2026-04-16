@@ -156,12 +156,17 @@ export class ClobClient {
         logWarn("POLY_FUNDER required for proxy wallet");
       }
     } else {
-      try {
-        this.signatureType = parseInt(walletType);
-        this.funder = process.env.POLY_FUNDER?.trim() || null;
-      } catch {
+      // parseInt never throws — it returns NaN for non-numeric input.
+      // NaN embedded in the EIP-712 signatureType field produces a malformed
+      // order that the exchange always rejects. Fall back to 0 (EOA) instead.
+      const parsed = parseInt(walletType, 10);
+      if (Number.isNaN(parsed)) {
+        logWarn(`Unrecognised POLY_WALLET_TYPE "${walletType}" — defaulting to EOA (0)`);
         this.signatureType = 0;
         this.funder = null;
+      } else {
+        this.signatureType = parsed;
+        this.funder = process.env.POLY_FUNDER?.trim() || null;
       }
     }
 
@@ -260,16 +265,20 @@ export class ClobClient {
   }
 
   /**
-   * Calculate market price for a specific token, side, and amount
-   * Uses Polymarket's CLOB API to calculate executable price considering orderbook depth
-   * This is more accurate than best_ask/best_bid for specific trade sizes
-   * See: https://docs.polymarket.com/developers/CLOB/clients/methods-public#calculatemarketprice
-   * 
-   * @param tokenID - Token ID to calculate price for
-   * @param side - "BUY" or "SELL"
-   * @param amount - Amount of tokens to buy/sell
-   * @param orderType - Order type (default: "FOK" for Fill-or-Kill)
-   * @returns Calculated market price, or null if calculation fails
+   * Calculate market price for a specific token, side, and amount.
+   *
+   * The `/calculate_market_price` endpoint interprets `amount` differently by side:
+   *   BUY  → amount is the USDC to spend (cost), NOT the number of shares desired.
+   *   SELL → amount is the number of shares to sell.
+   *
+   * Callers must convert share quantities to USDC cost before calling for BUY:
+   *   usdcAmount = shares * estimatedPrice
+   *
+   * @param tokenID   - Token ID
+   * @param side      - "BUY" or "SELL"
+   * @param amount    - USDC cost (BUY) or share count (SELL)
+   * @param orderType - Order type (default: "FOK")
+   * @returns Per-share price at the given depth, or null on failure
    */
   async calculateMarketPrice(
     tokenID: string,
@@ -318,15 +327,18 @@ export class ClobClient {
    * Falls back to getPrice if calculation fails
    */
   async getExecutableBuyPrice(tokenID: string, amount: number): Promise<number | null> {
-    // Try calculateMarketPrice first (more accurate for specific amounts)
-    const calculatedPrice = await this.calculateMarketPrice(tokenID, "BUY", amount, "FOK");
+    // calculateMarketPrice expects USDC cost for BUY, not share count.
+    // Use a rough estimate: amount * 0.5 (midpoint) as the USDC proxy.
+    // This is only used for pre-trade price discovery, not order construction.
+    const usdcEstimate = amount * 0.5;
+    const calculatedPrice = await this.calculateMarketPrice(tokenID, "BUY", usdcEstimate, "FOK");
     if (calculatedPrice !== null && calculatedPrice > 0) {
       return calculatedPrice;
     }
 
-    // Fallback to simple price endpoint
+    // Fallback to simple price endpoint (side must be lowercase per API spec)
     try {
-      const url = `${CLOB_HOST}/price?token_id=${tokenID}&side=BUY`;
+      const url = `${CLOB_HOST}/price?token_id=${tokenID}&side=buy`;
       const response = await fetch(url);
       if (response.ok) {
         const data = (await response.json()) as { price?: string };
@@ -522,16 +534,24 @@ export class ClobClient {
     // SELL: directions reversed.
     const priceMicro   = BigInt(Math.round(args.price * 1e4));
     const sizeHundreds = BigInt(Math.round(args.size  * 1e2));
-    const SHARE_MULTIPLIER = BigInt("10000000000000000"); // 1e16
+
+    // Polymarket CTFExchange conditional (outcome) tokens use 6 decimal places,
+    // matching USDC — NOT 18dp like most ERC-20s. 1 outcome share = 1e6 base units.
+    // Source: py-clob-client CONDITIONAL_TOKEN_DECIMALS = 6.
+    //
+    // sharesAmount  = size * 1e6
+    //              = (sizeHundreds / 1e2) * 1e6
+    //              = sizeHundreds * 1e4          ← multiplier is 1e4, not 1e16
+    const SHARE_MULTIPLIER = BigInt("10000"); // 1e4 → 6dp shares
 
     let makerAmount: bigint;
     let takerAmount: bigint;
 
     if (args.side === "BUY") {
       makerAmount = priceMicro * sizeHundreds;          // USDC (6dp)
-      takerAmount = sizeHundreds * SHARE_MULTIPLIER;    // shares (18dp)
+      takerAmount = sizeHundreds * SHARE_MULTIPLIER;    // shares (6dp)
     } else {
-      makerAmount = sizeHundreds * SHARE_MULTIPLIER;    // shares (18dp)
+      makerAmount = sizeHundreds * SHARE_MULTIPLIER;    // shares (6dp)
       takerAmount = priceMicro * sizeHundreds;          // USDC (6dp)
     }
 
@@ -627,10 +647,11 @@ export class ClobClient {
         roundedSize = Math.ceil((1.0 / roundedPrice) * 100) / 100;
       }
 
-      // Ensure maker amount (price * size) has <= 2 decimals
-      while (this.decimalPlaces(roundedPrice * roundedSize) > 2) {
-        roundedSize = Math.round((roundedSize + 0.01) * 100) / 100;
-      }
+      // NOTE: The former `while (decimalPlaces(price * size) > 2)` loop has been
+      // removed. IEEE-754 means almost every float product has 20 "decimal places"
+      // as reported by toFixed(20), so the loop incremented size without bound.
+      // createOrder uses BigInt(Math.round(price * 1e4)) * BigInt(Math.round(size * 1e2))
+      // internally, which always produces an exact integer — the loop was unnecessary.
 
       // Create full order object
       const orderArgs: OrderArgs = {
@@ -736,13 +757,17 @@ export class ClobClient {
       // at $0.01/share the $1 floor would force an unreasonably large size.
       // We sell exactly what we hold.
 
-      // Ensure takerAmount (price * size) has <= 2 decimal places.
-      // Round DOWN (not up) — selling more than the held position would cause
-      // the exchange to reject the order, leaving a naked position open.
-      while (this.decimalPlaces(roundedPrice * roundedSize) > 2) {
-        roundedSize = Math.round((roundedSize - 0.01) * 100) / 100;
-        if (roundedSize <= 0) break;
+      // Guard: a zero or negative sell size would submit a worthless order and
+      // leave the naked position open. Return an error immediately so the caller
+      // throws UnwindFailedError instead of silently doing nothing.
+      if (roundedSize <= 0) {
+        logError(`placeSellOrder: computed roundedSize=${roundedSize} for size=${size} — refusing to submit zero-size sell`);
+        return { error: `Invalid sell size: rounded to ${roundedSize}` };
       }
+
+      // NOTE: The former decimalPlaces while loop has been removed (same IEEE-754
+      // issue as placeBuyOrder — see that method's comment). createOrder uses
+      // BigInt(Math.round(...)) so the product's float representation is irrelevant.
 
       const orderArgs: OrderArgs = {
         price: roundedPrice,
@@ -846,10 +871,7 @@ export class ClobClient {
           roundedSize = Math.ceil((1.0 / roundedPrice) * 100) / 100;
         }
 
-        // Ensure maker amount has <= 2 decimals
-        while (this.decimalPlaces(roundedPrice * roundedSize) > 2) {
-          roundedSize = Math.round((roundedSize + 0.01) * 100) / 100;
-        }
+        // NOTE: decimalPlaces while loop removed — see placeBuyOrder comment.
 
         const order = await this.createOrder({
           price: roundedPrice,
@@ -885,6 +907,10 @@ export class ClobClient {
       if (!response.ok) {
         const errorText = await response.text();
         logError(`Batch order placement failed: ${response.status} ${errorText}`);
+        // Nonces were incremented eagerly before this HTTP call. The exchange
+        // never saw them, so the local counter is ahead of on-chain state.
+        // Reset so the next attempt re-fetches the authoritative nonce.
+        this.nonce = null;
         return orders.map(() => ({ error: `HTTP ${response.status}: ${errorText}` }));
       }
 
