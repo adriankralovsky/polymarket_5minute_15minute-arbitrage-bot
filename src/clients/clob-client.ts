@@ -629,6 +629,103 @@ export class ClobClient {
   }
 
   /**
+   * Place a sell order (used exclusively for emergency unwinds).
+   *
+   * Callers should pass UNWIND_SELL_PRICE (e.g. $0.01) so the FAK sweeps
+   * the entire bid-side of the book regardless of current market price.
+   */
+  async placeSellOrder(
+    tokenId: string,
+    price: number,
+    size: number,
+    orderType: "FOK" | "FAK" | "GTC" | "GTD" = "FAK",
+    expiration?: number,
+  ): Promise<ClobOrderResponse> {
+    try {
+      // Conditional token allowance is required for selling shares
+      await this.updateBalanceAllowance("CONDITIONAL", tokenId);
+
+      // Round price and size per API requirements (price: 4dp, size: 2dp)
+      const roundedPrice = Math.round(price * 10000) / 10000;
+      let roundedSize = Math.round(size * 100) / 100;
+
+      // For unwind sells the minimum-value check is skipped intentionally —
+      // at $0.01/share the $1 floor would force an unreasonably large size.
+      // We sell exactly what we hold.
+
+      // Ensure takerAmount (price * size) has <= 2 decimal places
+      while (this.decimalPlaces(roundedPrice * roundedSize) > 2) {
+        roundedSize = Math.round((roundedSize + 0.01) * 100) / 100;
+      }
+
+      const orderArgs: OrderArgs = {
+        price: roundedPrice,
+        size: roundedSize,
+        side: "SELL",
+        tokenId,
+        expiration: expiration || (orderType === "GTD" ? Math.floor(Date.now() / 1000) + 3600 : 0),
+      };
+
+      const order = await this.createOrder(orderArgs);
+
+      const postOrder: PostOrderPayload = {
+        order,
+        orderType,
+        postOnly: false,
+      };
+
+      if (this.apiKey) {
+        postOrder.owner = this.apiKey;
+      }
+
+      const url = `${CLOB_HOST}/order`;
+      const response = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(postOrder),
+      });
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        logError(`Sell order placement failed: ${response.status} ${errorText}`);
+        return { error: `HTTP ${response.status}: ${errorText}` };
+      }
+
+      const result = (await response.json()) as {
+        success?: boolean;
+        orderID?: string;
+        order_id?: string;
+        orderId?: string;
+        status?: string;
+        errorMsg?: string;
+        [key: string]: unknown;
+      };
+
+      if (result.success === false || result.errorMsg) {
+        logError(`Sell order placement error: ${result.errorMsg || "Unknown error"}`);
+        return {
+          error: result.errorMsg || "Sell order placement failed",
+          status: result.status,
+        };
+      }
+
+      logInfo(`Sell order placed: ${result.orderID || result.order_id || result.orderId || "unknown"}`);
+      this.incrementNonce();
+
+      return {
+        orderID: result.orderID || result.order_id || result.orderId,
+        status: result.status,
+        raw: result,
+      };
+    } catch (error) {
+      logError("Failed to place sell order:", error);
+      return {
+        error: error instanceof Error ? error.message : String(error),
+      };
+    }
+  }
+
+  /**
    * Place multiple orders in a single batch request
    * According to https://docs.polymarket.com/developers/CLOB/orders/create-order-batch
    * Supports up to 15 orders per request

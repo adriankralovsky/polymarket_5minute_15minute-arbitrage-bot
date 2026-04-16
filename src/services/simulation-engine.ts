@@ -92,7 +92,7 @@ export class SimulationEngine {
           orderType: this.detector.getOrderType(opportunity),
         };
 
-        const execution = await this.executor.executeTrade(tradeParams);
+        const execution = await this.executor.executeTradeBatch(tradeParams);
 
         if (execution.status === "filled") {
           result.successfulTrades++;

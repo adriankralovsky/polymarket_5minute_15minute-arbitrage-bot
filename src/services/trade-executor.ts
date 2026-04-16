@@ -1,7 +1,15 @@
 /**
- * Atomic trade execution system with parallel orders and timeout
- * Requirement: ≤50ms fill timeout, cancel other order if one fails
- * Implements EOA wallet approval and actual CLOB order placement
+ * Atomic trade execution system with Zero Naked Exposure guarantee.
+ *
+ * Core invariant: the bot will NEVER hold a single filled leg without the
+ * other. If one leg fills and the other misses, unwindPosition() immediately
+ * places an aggressive FAK SELL at UNWIND_SELL_PRICE ($0.01) to sweep the
+ * entire bid side. We accept maximum slippage on the unwind; avoiding a
+ * directional bet is the only priority.
+ *
+ * If the unwind itself fails, executeTradeBatch() throws UnwindFailedError.
+ * The caller (ArbitrageOrchestrator) must catch this, persist the record, and
+ * halt the bot. A naked position must never be silently ignored.
  */
 
 import type { TradeParams, TradeExecution, TradeStatus } from "../types";
@@ -9,23 +17,50 @@ import { logInfo, logError, logWarn, logDebug } from "../utils/logger";
 import { getConfig } from "../config";
 import { ClobClient } from "../clients/clob-client";
 
-// Simple UUID generator
+// The unwind sell price is hardcoded to the minimum valid tick ($0.01).
+// At this price the FAK SELL order sweeps every bid in the book, guaranteeing
+// a fill at whatever the market will pay. Do NOT use the original entry price:
+// the bid-ask spread would cause an instant FOK/FAK kill with no fill.
+const UNWIND_SELL_PRICE = 0.01;
+
 function generateUUID(): string {
   return `${Date.now()}-${Math.random().toString(36).substr(2, 9)}-${Math.random().toString(36).substr(2, 9)}`;
 }
 
-interface OrderResult {
-  success: boolean;
-  orderId?: string;
-  status?: string;
-  error?: string;
-  filled?: boolean;
+/**
+ * Thrown when an emergency unwind sell order fails to fill.
+ * The bot MUST halt when this is caught — a live naked position exists that
+ * requires manual resolution.
+ */
+export class UnwindFailedError extends Error {
+  public readonly legName: string;
+  public readonly tokenId: string;
+  public readonly quantity: number;
+  /** Attached so the orchestrator can persist a full trade record before halting. */
+  public readonly partialExecution: TradeExecution;
+
+  constructor(
+    legName: string,
+    tokenId: string,
+    quantity: number,
+    partialExecution: TradeExecution,
+  ) {
+    super(
+      `CRITICAL: Unwind of ${legName} leg failed ` +
+        `(token: ${tokenId.substring(0, 20)}..., qty: ${quantity}). ` +
+        `Naked position exists — manual resolution required. Bot halting.`,
+    );
+    this.name = "UnwindFailedError";
+    this.legName = legName;
+    this.tokenId = tokenId;
+    this.quantity = quantity;
+    this.partialExecution = partialExecution;
+  }
 }
 
 export class TradeExecutor {
   private config = getConfig();
   private clobClient: ClobClient;
-  private pendingOrders: Map<string, { cancel: () => Promise<void> }> = new Map();
   private approvalDone = false;
 
   constructor() {
@@ -38,13 +73,12 @@ export class TradeExecutor {
   }
 
   /**
-   * Ensure wallet is approved (call before first trade)
+   * Ensure wallet is approved (call before first trade).
    */
   async ensureApproved(): Promise<boolean> {
     if (this.approvalDone) {
       return true;
     }
-
     logInfo("Ensuring wallet approval...");
     const success = await this.clobClient.approve();
     if (success) {
@@ -54,362 +88,211 @@ export class TradeExecutor {
   }
 
   /**
-   * Execute atomic arbitrage trade (requirement 6)
-   * Submits both orders in parallel with ≤50ms timeout
-   */
-  async executeTrade(params: TradeParams): Promise<TradeExecution> {
-    const tradeId = generateUUID();
-    const startTime = Date.now();
-
-    logInfo(`Executing trade ${tradeId}: UP in ${params.upMarket}, DOWN in ${params.downMarket}`);
-
-    // Execute both orders in parallel
-    const [upResult, downResult] = await Promise.allSettled([
-      this.executeOrder(
-        params.upTokenId,
-        params.upPrice,
-        params.quantity,
-        params.orderType,
-        params.limitPrice,
-      ),
-      this.executeOrder(
-        params.downTokenId,
-        params.downPrice,
-        params.quantity,
-        params.orderType,
-        params.limitPrice,
-      ),
-    ]);
-
-    const latency = Date.now() - startTime;
-
-    // Check timeout
-    if (latency > this.config.executionTimeoutMs) {
-      logWarn(`Trade ${tradeId} exceeded timeout: ${latency}ms > ${this.config.executionTimeoutMs}ms`);
-      // Cancel both orders if still pending
-      await this.cancelBothOrders(upResult, downResult);
-      return this.createTradeExecution(
-        tradeId,
-        params,
-        latency,
-        "failed",
-        undefined,
-        undefined,
-        "Execution timeout exceeded",
-      );
-    }
-
-    // Process results
-    const upOrderResult =
-      upResult.status === "fulfilled" ? upResult.value : { success: false, error: "Promise rejected" };
-    const downOrderResult =
-      downResult.status === "fulfilled"
-        ? downResult.value
-        : { success: false, error: "Promise rejected" };
-
-    // If one order fails, cancel the other (requirement 6)
-    if (!upOrderResult.success && downOrderResult.success) {
-      logWarn(`UP order failed, canceling DOWN order`);
-      if (downOrderResult.orderId) {
-        await this.cancelOrder(downOrderResult.orderId);
-      }
-      return this.createTradeExecution(
-        tradeId,
-        params,
-        latency,
-        "failed",
-        upOrderResult.orderId,
-        downOrderResult.orderId,
-        `UP order failed: ${upOrderResult.error || "unknown"}`,
-      );
-    }
-
-    if (upOrderResult.success && !downOrderResult.success) {
-      logWarn(`DOWN order failed, canceling UP order`);
-      if (upOrderResult.orderId) {
-        await this.cancelOrder(upOrderResult.orderId);
-      }
-      return this.createTradeExecution(
-        tradeId,
-        params,
-        latency,
-        "failed",
-        upOrderResult.orderId,
-        downOrderResult.orderId,
-        `DOWN order failed: ${downOrderResult.error || "unknown"}`,
-      );
-    }
-
-    if (!upOrderResult.success && !downOrderResult.success) {
-      return this.createTradeExecution(
-        tradeId,
-        params,
-        latency,
-        "failed",
-        upOrderResult.orderId,
-        downOrderResult.orderId,
-        `Both orders failed: UP=${upOrderResult.error || "unknown"}, DOWN=${downOrderResult.error || "unknown"}`,
-      );
-    }
-
-    // Both orders succeeded
-    const status: TradeStatus = upOrderResult.filled && downOrderResult.filled ? "filled" : "pending";
-
-    return this.createTradeExecution(
-      tradeId,
-      params,
-      latency,
-      status,
-      upOrderResult.orderId,
-      downOrderResult.orderId,
-      undefined,
-    );
-  }
-
-  /**
-   * Execute a single order using CLOB API
-   */
-  private async executeOrder(
-    tokenId: string,
-    price: number,
-    quantity: number,
-    orderType: "market" | "limit",
-    limitPrice?: number,
-  ): Promise<OrderResult> {
-    try {
-      // Ensure approval is done
-      if (!this.approvalDone) {
-        await this.ensureApproved();
-      }
-
-      const executionPrice = orderType === "market" ? price : (limitPrice || price);
-      logDebug(`Executing ${orderType} order: token=${tokenId.substring(0, 20)}..., price=${executionPrice}, qty=${quantity}`);
-
-      // Place order via CLOB API (FOK for immediate execution)
-      // According to Polymarket docs: FOK orders must fill completely or are cancelled
-      const response = await this.clobClient.placeBuyOrder(
-        tokenId,
-        executionPrice,
-        quantity,
-        "FOK", // Fill or Kill for atomic execution
-      );
-
-      if (response.error) {
-        return {
-          success: false,
-          error: response.error,
-        };
-      }
-
-      // Check if order was filled immediately (FOK orders either fill or fail)
-      // Status can be: "matched", "live", "delayed", "unmatched" per Polymarket docs
-      const isFilled = response.status === "matched" || response.status === "MATCHED";
-
-      return {
-        success: true,
-        orderId: response.orderID,
-        status: response.status || (isFilled ? "matched" : "unmatched"),
-        filled: isFilled,
-      };
-    } catch (error) {
-      logError(`Order execution error:`, error);
-      return {
-        success: false,
-        error: error instanceof Error ? error.message : String(error),
-      };
-    }
-  }
-
-  /**
-   * Execute both orders atomically using batch orders endpoint
-   * According to https://docs.polymarket.com/developers/CLOB/orders/create-order-batch
-   * This is better for atomic execution than placing orders separately
+   * Execute atomic arbitrage trade via the Polymarket batch orders endpoint.
+   *
+   * Submits both legs as FOK (Fill-Or-Kill) in a single HTTP call. Because
+   * Polymarket's matching engine processes orders sequentially even in a batch,
+   * atomicity is NOT guaranteed by the API. We enforce it ourselves:
+   *
+   *   Both filled      → status "filled"        (clean arbitrage win)
+   *   Neither filled   → status "failed"        (clean miss, zero exposure)
+   *   One filled only  → unwindPosition()       (FAK sell at $0.01 to sweep bids)
+   *                      status "partial_unwind" on success
+   *
+   * @throws UnwindFailedError  if the emergency sell does not fill. The caller
+   *   (ArbitrageOrchestrator) must catch this and halt the bot immediately.
    */
   async executeTradeBatch(params: TradeParams): Promise<TradeExecution> {
     const tradeId = generateUUID();
     const startTime = Date.now();
 
-    logInfo(`Executing batch trade ${tradeId}: UP in ${params.upMarket}, DOWN in ${params.downMarket}`);
+    logInfo(`[${tradeId}] Submitting batch FOK: UP(${params.upMarket}) / DOWN(${params.downMarket})`);
+
+    if (!this.approvalDone) {
+      await this.ensureApproved();
+    }
+
+    let upOrderId: string | undefined;
+    let downOrderId: string | undefined;
 
     try {
-      // Ensure approval is done
-      if (!this.approvalDone) {
-        await this.ensureApproved();
-      }
-
-      // Create batch order request
-      const orderType: "FOK" | "FAK" | "GTC" | "GTD" = params.orderType === "market" ? "FOK" : "GTC";
-      const orders = [
+      const results = await this.clobClient.placeBatchOrders([
         {
           tokenId: params.upTokenId,
           price: params.upPrice,
           size: params.quantity,
-          side: "BUY" as const,
-          orderType,
+          side: "BUY",
+          orderType: "FOK",
         },
         {
           tokenId: params.downTokenId,
           price: params.downPrice,
           size: params.quantity,
-          side: "BUY" as const,
-          orderType,
+          side: "BUY",
+          orderType: "FOK",
         },
-      ];
+      ]);
 
-      // Place batch orders
-      const results = await this.clobClient.placeBatchOrders(orders);
       const latency = Date.now() - startTime;
-
-      // Check timeout
-      if (latency > this.config.executionTimeoutMs) {
-        logWarn(`Trade ${tradeId} exceeded timeout: ${latency}ms > ${this.config.executionTimeoutMs}ms`);
-        // Cancel both orders if they were placed
-        for (const result of results) {
-          if (result.orderID) {
-            await this.cancelOrder(result.orderID);
-          }
-        }
-        return this.createTradeExecution(
-          tradeId,
-          params,
-          latency,
-          "failed",
-          results[0]?.orderID,
-          results[1]?.orderID,
-          "Execution timeout exceeded",
-        );
-      }
-
-      // Process results
       const upResult = results[0];
       const downResult = results[1];
 
-      // If one order fails, cancel the other
-      if (upResult.error && !downResult.error) {
-        logWarn(`UP order failed, canceling DOWN order`);
-        if (downResult.orderID) {
-          await this.cancelOrder(downResult.orderID);
-        }
-        return this.createTradeExecution(
-          tradeId,
-          params,
-          latency,
-          "failed",
-          upResult.orderID,
-          downResult.orderID,
-          `UP order failed: ${upResult.error}`,
-        );
+      upOrderId = upResult?.orderID;
+      downOrderId = downResult?.orderID;
+
+      // A leg is filled only when the matching engine confirms "matched".
+      // HTTP-200 with status "unmatched" means the FOK was killed — that is a
+      // miss, not a success. We must never treat a kill as a fill.
+      const upFilled = !upResult?.error && upResult?.status === "matched";
+      const downFilled = !downResult?.error && downResult?.status === "matched";
+
+      logDebug(
+        `[${tradeId}] UP: ${upFilled ? "FILLED" : "MISSED"} ` +
+          `(${upResult?.status ?? upResult?.error ?? "no response"}), ` +
+          `DOWN: ${downFilled ? "FILLED" : "MISSED"} ` +
+          `(${downResult?.status ?? downResult?.error ?? "no response"})`,
+      );
+
+      // ── Both legs filled ──────────────────────────────────────────────────
+      if (upFilled && downFilled) {
+        logInfo(`[${tradeId}] Both legs filled — clean arbitrage.`);
+        return this.buildExecution(tradeId, params, latency, "filled", upOrderId, downOrderId);
       }
 
-      if (!upResult.error && downResult.error) {
-        logWarn(`DOWN order failed, canceling UP order`);
-        if (upResult.orderID) {
-          await this.cancelOrder(upResult.orderID);
-        }
-        return this.createTradeExecution(
-          tradeId,
-          params,
-          latency,
-          "failed",
-          upResult.orderID,
-          downResult.orderID,
-          `DOWN order failed: ${downResult.error}`,
-        );
+      // ── Neither leg filled ────────────────────────────────────────────────
+      if (!upFilled && !downFilled) {
+        const reason =
+          `UP: ${upResult?.error ?? upResult?.status ?? "unmatched"}, ` +
+          `DOWN: ${downResult?.error ?? downResult?.status ?? "unmatched"}`;
+        logInfo(`[${tradeId}] Neither leg filled — clean miss. ${reason}`);
+        return this.buildExecution(tradeId, params, latency, "failed", upOrderId, downOrderId, reason);
       }
 
-      if (upResult.error && downResult.error) {
-        return this.createTradeExecution(
+      // ── Partial fill — one leg filled, one missed ─────────────────────────
+      const filledLegName = upFilled ? "UP" : "DOWN";
+      const filledTokenId = upFilled ? params.upTokenId : params.downTokenId;
+      const missedLegName = upFilled ? "DOWN" : "UP";
+
+      logWarn(
+        `[${tradeId}] PARTIAL FILL DETECTED: ${filledLegName} leg filled, ` +
+          `${missedLegName} leg missed. Initiating emergency unwind.`,
+      );
+
+      const unwindResult = await this.unwindPosition(filledLegName, filledTokenId, params.quantity, tradeId);
+
+      if (!unwindResult.success) {
+        // Build the execution record so the orchestrator can persist it before halting.
+        const failedExecution = this.buildExecution(
           tradeId,
           params,
-          latency,
-          "failed",
-          upResult.orderID,
-          downResult.orderID,
-          `Both orders failed: UP=${upResult.error}, DOWN=${downResult.error}`,
+          Date.now() - startTime,
+          "partial_unwind",
+          upOrderId,
+          downOrderId,
+          `${filledLegName} leg filled; ${missedLegName} missed; UNWIND FAILED: ${unwindResult.error}`,
         );
+        throw new UnwindFailedError(filledLegName, filledTokenId, params.quantity, failedExecution);
       }
 
-      // Both orders succeeded
-      const upFilled = upResult.status === "matched";
-      const downFilled = downResult.status === "matched";
-      const status: TradeStatus = upFilled && downFilled ? "filled" : "pending";
+      logInfo(`[${tradeId}] Unwind successful (sell order: ${unwindResult.orderId}). Position closed.`);
 
-      return this.createTradeExecution(
+      return this.buildExecution(
         tradeId,
         params,
-        latency,
-        status,
-        upResult.orderID,
-        downResult.orderID,
-        undefined,
+        Date.now() - startTime,
+        "partial_unwind",
+        upOrderId,
+        downOrderId,
+        `${filledLegName} filled; ${missedLegName} missed FOK; position unwound via sell ${unwindResult.orderId}.`,
+        unwindResult.orderId,
       );
     } catch (error) {
+      // Re-throw UnwindFailedError — orchestrator must catch and halt.
+      if (error instanceof UnwindFailedError) {
+        throw error;
+      }
+
       const latency = Date.now() - startTime;
-      logError(`Batch trade execution error:`, error);
-      return this.createTradeExecution(
+      logError(`[${tradeId}] Unexpected error during batch execution:`, error);
+      return this.buildExecution(
         tradeId,
         params,
         latency,
         "failed",
-        undefined,
-        undefined,
+        upOrderId,
+        downOrderId,
         error instanceof Error ? error.message : String(error),
       );
     }
   }
 
   /**
-   * Cancel an order via CLOB API
+   * Emergency unwind: eliminate a naked position by selling the filled leg.
+   *
+   * Places a FAK SELL at UNWIND_SELL_PRICE ($0.01). This price is deliberately
+   * below any realistic bid so the order sweeps the entire book and guarantees
+   * a fill. We accept full market impact; removing the position is the only
+   * priority.
+   *
+   * Returns a result object rather than throwing so the caller can attach the
+   * partial execution record to UnwindFailedError before re-throwing.
    */
-  private async cancelOrder(orderId: string): Promise<void> {
+  private async unwindPosition(
+    legName: string,
+    tokenId: string,
+    quantity: number,
+    tradeId: string,
+  ): Promise<{ success: boolean; orderId?: string; error?: string }> {
+    logWarn(
+      `[${tradeId}] UNWIND: FAK SELL ${legName} ` +
+        `(token: ${tokenId.substring(0, 20)}..., qty: ${quantity}, price: ${UNWIND_SELL_PRICE})`,
+    );
+
+    let response;
     try {
-      logDebug(`Canceling order: ${orderId}`);
-      const success = await this.clobClient.cancelOrder(orderId);
-      if (success) {
-        logInfo(`Order ${orderId} canceled successfully`);
-      } else {
-        logWarn(`Failed to cancel order ${orderId}`);
-      }
-      this.pendingOrders.delete(orderId);
-    } catch (error) {
-      logError(`Failed to cancel order ${orderId}:`, error);
+      response = await this.clobClient.placeSellOrder(tokenId, UNWIND_SELL_PRICE, quantity, "FAK");
+    } catch (err) {
+      return {
+        success: false,
+        error: `placeSellOrder threw: ${err instanceof Error ? err.message : String(err)}`,
+      };
     }
+
+    if (response.error || !response.orderID) {
+      return {
+        success: false,
+        error: response.error ?? "No orderID returned from sell endpoint",
+      };
+    }
+
+    // A FAK SELL at $0.01 should match against all bids in any liquid market.
+    // If the status is not "matched", there are genuinely no bids — halt required.
+    if (response.status !== "matched" && response.status !== "MATCHED") {
+      return {
+        success: false,
+        orderId: response.orderID,
+        error: `Sell order ${response.orderID} returned status "${response.status}" (expected "matched")`,
+      };
+    }
+
+    return { success: true, orderId: response.orderID };
   }
 
   /**
-   * Cancel both orders if needed
+   * Build a TradeExecution result object.
    */
-  private async cancelBothOrders(
-    upResult: PromiseSettledResult<OrderResult>,
-    downResult: PromiseSettledResult<OrderResult>,
-  ): Promise<void> {
-    const upOrderId =
-      upResult.status === "fulfilled" && upResult.value.success ? upResult.value.orderId : undefined;
-    const downOrderId =
-      downResult.status === "fulfilled" && downResult.value.success
-        ? downResult.value.orderId
-        : undefined;
-
-    await Promise.all([
-      upOrderId ? this.cancelOrder(upOrderId) : Promise.resolve(),
-      downOrderId ? this.cancelOrder(downOrderId) : Promise.resolve(),
-    ]);
-  }
-
-  /**
-   * Create trade execution result
-   */
-  private createTradeExecution(
+  private buildExecution(
     tradeId: string,
     params: TradeParams,
-    latency: number,
+    latencyMs: number,
     status: TradeStatus,
     upOrderId?: string,
     downOrderId?: string,
     error?: string,
+    unwindOrderId?: string,
   ): TradeExecution {
     const sumPrice = params.upPrice + params.downPrice;
-    const pnlEstimate = 1.0 - sumPrice; // Expected payout is 1.0, cost is sumPrice
+    const pnlEstimate = 1.0 - sumPrice;
 
     return {
       tradeId,
@@ -426,12 +309,13 @@ export class TradeExecutor {
         sumPrice,
       },
       quantity: params.quantity,
-      latencyMs: latency,
+      latencyMs,
       status,
       upOrderId,
       downOrderId,
-      upOrderStatus: status === "filled" ? "filled" : status,
-      downOrderStatus: status === "filled" ? "filled" : status,
+      upOrderStatus: status,
+      downOrderStatus: status,
+      unwindOrderId,
       error,
       pnlEstimate,
     };

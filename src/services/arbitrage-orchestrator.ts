@@ -6,7 +6,7 @@
 import { PolymarketClient } from "../clients/polymarket";
 import { MarketDataManager } from "./market-data-manager";
 import { ArbitrageDetector } from "./arbitrage-detector";
-import { TradeExecutor } from "./trade-executor";
+import { TradeExecutor, UnwindFailedError } from "./trade-executor";
 import { DatabaseService } from "./database";
 import { JsonLogger } from "./json-logger";
 import { logInfo, logError, logWarn, logDebug, logSyncDetected } from "../utils/logger";
@@ -321,15 +321,33 @@ export class ArbitrageOrchestrator {
 
     logInfo(`Executing arbitrage trade: ${opportunity.case}, sum=${opportunity.prices.sumPrice.toFixed(4)}`);
 
-    const execution = await this.executor.executeTrade(tradeParams);
+    try {
+      const execution = await this.executor.executeTradeBatch(tradeParams);
 
-    // Store trade record (requirement 8.1)
-    await this.storeTradeRecord(market5m, market15m, execution);
-
-    // Log execution
-    this.jsonLogger.logTradeExecution(market5m, market15m, execution);
-
-    this.dailyTradeCount++;
+      // Store trade record
+      await this.storeTradeRecord(market5m, market15m, execution);
+      this.jsonLogger.logTradeExecution(market5m, market15m, execution);
+      this.dailyTradeCount++;
+    } catch (error) {
+      if (error instanceof UnwindFailedError) {
+        // A naked position exists. Persist the partial execution record for
+        // post-mortem, then halt immediately. Do NOT continue trading.
+        logError(
+          `[CRITICAL] UNWIND FAILED — HALTING BOT IMMEDIATELY.\n${error.message}`,
+        );
+        try {
+          await this.storeTradeRecord(market5m, market15m, error.partialExecution);
+          this.jsonLogger.logTradeExecution(market5m, market15m, error.partialExecution);
+        } catch (dbErr) {
+          logError("Failed to persist unwind-failure record:", dbErr);
+        }
+        await this.stop();
+        return;
+      }
+      // Unexpected errors in the execution path should not crash the bot loop,
+      // but do log them at error level.
+      logError("Unexpected error in executeArbitrageTrade:", error);
+    }
   }
 
   /**

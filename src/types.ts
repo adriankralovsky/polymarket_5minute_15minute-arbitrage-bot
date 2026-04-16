@@ -4,7 +4,7 @@
 
 export type MarketType = "5m" | "15m";
 export type TokenSide = "up" | "down";
-export type TradeStatus = "filled" | "canceled" | "failed" | "pending";
+export type TradeStatus = "filled" | "canceled" | "failed" | "pending" | "partial_unwind";
 export type MarketResult = "UP" | "DOWN" | "PENDING";
 
 /**
@@ -130,6 +130,7 @@ export interface TradeExecution {
   downOrderId?: string;
   upOrderStatus?: string;
   downOrderStatus?: string;
+  unwindOrderId?: string;
   error?: string;
   pnlEstimate: number;
 }

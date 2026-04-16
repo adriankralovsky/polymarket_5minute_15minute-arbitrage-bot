@@ -7,3 +7,11 @@ logs/
 .DS_Store
 ARCHITECTURE.md
 EXECUTION_FLOW.md
+
+# Claude / claude-flow tooling artifacts
+.claude/
+.claude-flow/
+.swarm/
+.mcp.json
+agentdb.rvf
+agentdb.rvf.lock
