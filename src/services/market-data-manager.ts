@@ -736,9 +736,10 @@ export class MarketDataManager {
         source: "websocket",
       });
 
-      // Keep only last 1000 price snapshots
-      if (market.priceHistory.length > 1000) {
-        market.priceHistory = market.priceHistory.slice(-1000);
+      // Rolling 60-entry buffer (~30 seconds at 2 ticks/sec per token).
+      // Used by the volatility filter and slippage estimator in ArbitrageDetector.
+      if (market.priceHistory.length > 60) {
+        market.priceHistory = market.priceHistory.slice(-60);
       }
     }
 

@@ -97,18 +97,13 @@ export class DatabaseService {
    * Ensure connection is active, reconnect if needed
    */
   private async ensureConnection(): Promise<void> {
+    // Trust isConnected — the 30-second health-check interval handles failures.
+    // Do NOT ping on every call: at 100+ WebSocket ticks/sec that queues
+    // thousands of async round-trips, each holding a large marketRecord in
+    // memory, causing an OOM crash within minutes.
     if (!this.isConnected || !this.client || !this.db) {
       logWarn("MongoDB connection lost, reconnecting...");
       await this.connect();
-    } else {
-      // Quick health check
-      try {
-        await this.db.admin().ping();
-      } catch (error) {
-        logWarn("MongoDB ping failed, reconnecting...");
-        this.isConnected = false;
-        await this.connect();
-      }
     }
   }
 

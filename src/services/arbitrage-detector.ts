@@ -3,7 +3,7 @@
  * Implements Cases A, B, and C from specification
  */
 
-import type { MarketData, ArbitrageOpportunity, MarketType } from "../types";
+import type { MarketData, ArbitrageOpportunity, MarketType, PriceSnapshot } from "../types";
 import { logInfo, logDebug, logWarn } from "../utils/logger";
 import { getConfig } from "../config";
 
@@ -245,6 +245,100 @@ export class ArbitrageDetector {
       timestamp: Date.now(),
       reason: `Both sums (${sum1.toFixed(4)}, ${sum2.toFixed(4)}) >= threshold ${this.config.arbThreshold}`,
     };
+  }
+
+  /**
+   * Returns true if the market's UP or DOWN price range over the recent history
+   * window exceeds config.maxPriceVolatility.
+   *
+   * A large range means the market is moving too fast to enter safely — the
+   * price we detected may already be stale by the time the order reaches the
+   * matching engine. Trades are skipped when this returns true.
+   *
+   * The filter is dormant until at least config.minHistoryForFilter snapshots
+   * have accumulated, preventing false positives on bot startup.
+   */
+  isMarketTooVolatile(market: MarketData): boolean {
+    const history = market.priceHistory;
+    if (history.length < this.config.minHistoryForFilter) {
+      return false;
+    }
+
+    const upPrices = history
+      .map((s: PriceSnapshot) => s.upPrice)
+      .filter((p): p is number => p !== null && p > 0);
+    const downPrices = history
+      .map((s: PriceSnapshot) => s.downPrice)
+      .filter((p): p is number => p !== null && p > 0);
+
+    if (
+      upPrices.length < this.config.minHistoryForFilter ||
+      downPrices.length < this.config.minHistoryForFilter
+    ) {
+      return false;
+    }
+
+    const upRange   = Math.max(...upPrices)   - Math.min(...upPrices);
+    const downRange = Math.max(...downPrices) - Math.min(...downPrices);
+
+    if (upRange > this.config.maxPriceVolatility) {
+      logWarn(
+        `Volatility: UP range ${upRange.toFixed(4)} > threshold ${this.config.maxPriceVolatility} ` +
+        `on market ${market.marketId}`,
+      );
+      return true;
+    }
+    if (downRange > this.config.maxPriceVolatility) {
+      logWarn(
+        `Volatility: DOWN range ${downRange.toFixed(4)} > threshold ${this.config.maxPriceVolatility} ` +
+        `on market ${market.marketId}`,
+      );
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * Estimates the slippage fraction for one leg based on recent tick velocity.
+   *
+   * Computes the average absolute change between consecutive price snapshots,
+   * expresses it as a fraction of current price, then adds a 50% safety buffer.
+   * Result is clamped between config.maxSlippage (floor) and 2× that (ceiling).
+   *
+   * This replaces the flat config.maxSlippage value when building order prices,
+   * so fast-moving markets get a wider limit and slow markets stay tight.
+   */
+  estimateSlippageFromHistory(market: MarketData, side: "up" | "down"): number {
+    const history = market.priceHistory;
+
+    if (history.length < 2) {
+      return this.config.maxSlippage;
+    }
+
+    const prices = history
+      .map((s: PriceSnapshot) => (side === "up" ? s.upPrice : s.downPrice))
+      .filter((p): p is number => p !== null && p > 0);
+
+    if (prices.length < 2) {
+      return this.config.maxSlippage;
+    }
+
+    // Average absolute change between consecutive snapshots
+    let totalChange = 0;
+    for (let i = 1; i < prices.length; i++) {
+      totalChange += Math.abs(prices[i] - prices[i - 1]);
+    }
+    const avgTickChange = totalChange / (prices.length - 1);
+
+    const currentPrice = prices[prices.length - 1];
+    if (currentPrice <= 0) return this.config.maxSlippage;
+
+    // Convert to a fraction, add 50% buffer, clamp to [maxSlippage, 2×maxSlippage]
+    const estimated = (avgTickChange / currentPrice) * 1.5;
+    return Math.max(
+      this.config.maxSlippage,
+      Math.min(estimated, this.config.maxSlippage * 2),
+    );
   }
 
   /**

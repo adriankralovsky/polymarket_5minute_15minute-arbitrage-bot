@@ -8,6 +8,11 @@ logs/
 ARCHITECTURE.md
 EXECUTION_FLOW.md
 
+# Editor swap/temp files
+*.swp
+*.swo
+*~
+
 # Claude / claude-flow tooling artifacts
 .claude/
 .claude-flow/

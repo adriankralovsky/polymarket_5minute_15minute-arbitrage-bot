@@ -25,6 +25,11 @@ export class ArbitrageOrchestrator {
   private monitoringInterval: NodeJS.Timeout | null = null;
   private dailyTradeCount = 0;
   private lastTradeDate = new Date().toDateString();
+  // Throttle market-data DB writes: at 100+ WebSocket ticks/sec, writing on
+  // every update causes thousands of queued MongoDB ops and an OOM crash.
+  // 5 seconds is plenty for observability; trades use their own write path.
+  private readonly MARKET_DATA_WRITE_INTERVAL_MS = 5000;
+  private lastMarketDataWrite: Map<string, number> = new Map();
 
   constructor() {
     this.client = new PolymarketClient();
@@ -223,14 +228,18 @@ export class ArbitrageOrchestrator {
   }
 
   /**
-   * Handle market data update
+   * Handle market data update (throttled DB write)
    */
   private handleMarketDataUpdate(marketType: "5m" | "15m", data: MarketData): void {
     logDebug(`Market data updated: ${marketType} market ${data.marketId}`);
-    // Update database
-    this.storeMarketData(data).catch((error) => {
-      logError("Failed to store market data update:", error);
-    });
+    const now = Date.now();
+    const lastWrite = this.lastMarketDataWrite.get(data.marketId) ?? 0;
+    if (now - lastWrite >= this.MARKET_DATA_WRITE_INTERVAL_MS) {
+      this.lastMarketDataWrite.set(data.marketId, now);
+      this.storeMarketData(data).catch((error) => {
+        logError("Failed to store market data update:", error);
+      });
+    }
   }
 
   /**
@@ -255,6 +264,14 @@ export class ArbitrageOrchestrator {
     const opportunity = this.detector.detectArbitrage(market5m, market15m);
 
     if (opportunity.exists && opportunity.prices && opportunity.direction) {
+      // Volatility gate — abort if either market is moving too fast to arb safely
+      if (this.detector.isMarketTooVolatile(market5m) || this.detector.isMarketTooVolatile(market15m)) {
+        logWarn(
+          `Volatile market — skipping arb (5m: ${market5m.marketId}, 15m: ${market15m.marketId})`,
+        );
+        return;
+      }
+
       // Log sync detection (requirement 9.1)
       logSyncDetected(
         opportunity.direction,
@@ -303,17 +320,45 @@ export class ArbitrageOrchestrator {
     const downTokenId = downMarket === "5m" ? market5m.tokens.downTokenId : market15m.tokens.downTokenId;
 
     const orderType = this.detector.getOrderType(opportunity);
-    const limitPrice = orderType === "limit" 
+    const limitPrice = orderType === "limit"
       ? this.detector.calculateLimitPrice(opportunity.prices.upPrice, opportunity)
       : undefined;
+
+    // Apply history-based slippage estimates to each leg's order price.
+    // For FOK orders this sets the maximum price we're willing to pay,
+    // accommodating tick-level movement between detection and submission.
+    const upMarketData   = upMarket   === "5m" ? market5m : market15m;
+    const downMarketData = downMarket === "5m" ? market5m : market15m;
+
+    const upSlippage   = this.detector.estimateSlippageFromHistory(upMarketData,   "up");
+    const downSlippage = this.detector.estimateSlippageFromHistory(downMarketData, "down");
+
+    const adjustedUpPrice   = opportunity.prices.upPrice   * (1 + upSlippage);
+    const adjustedDownPrice = opportunity.prices.downPrice * (1 + downSlippage);
+
+    // If slippage pushes the combined cost above threshold, the arb is no
+    // longer profitable after execution costs — skip rather than trade at a loss
+    if (adjustedUpPrice + adjustedDownPrice >= this.config.arbThreshold) {
+      logWarn(
+        `Slippage-adjusted sum ${(adjustedUpPrice + adjustedDownPrice).toFixed(4)} ` +
+        `>= threshold ${this.config.arbThreshold} — skipping trade ` +
+        `(upSlippage: ${(upSlippage * 100).toFixed(2)}%, downSlippage: ${(downSlippage * 100).toFixed(2)}%)`,
+      );
+      return;
+    }
+
+    logDebug(
+      `Slippage estimates — UP: ${(upSlippage * 100).toFixed(2)}% → ${adjustedUpPrice.toFixed(4)}, ` +
+      `DOWN: ${(downSlippage * 100).toFixed(2)}% → ${adjustedDownPrice.toFixed(4)}`,
+    );
 
     const tradeParams = {
       upTokenId,
       downTokenId,
       upMarket,
       downMarket,
-      upPrice: opportunity.prices.upPrice,
-      downPrice: opportunity.prices.downPrice,
+      upPrice: adjustedUpPrice,
+      downPrice: adjustedDownPrice,
       quantity: this.config.defaultQuantity,
       orderType,
       limitPrice,

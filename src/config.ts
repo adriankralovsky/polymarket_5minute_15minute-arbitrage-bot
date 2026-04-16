@@ -34,6 +34,12 @@ export interface Config {
   cancelBeforeEndTimeMs: number;
   // Polygon RPC URL
   polygonRpcUrl: string;
+  // Volatility filter: abort trade if UP or DOWN price range over the 60-entry
+  // history window exceeds this value (e.g. 0.05 = 5¢ swing in ~30 seconds)
+  maxPriceVolatility: number;
+  // Minimum history entries required before the volatility/slippage filters
+  // activate — prevents false positives on bot startup when history is thin
+  minHistoryForFilter: number;
 }
 
 const defaultConfig: Config = {
@@ -55,6 +61,8 @@ const defaultConfig: Config = {
   maxDataAgeMs: parseInt(process.env.MAX_DATA_AGE_MS || "5000"),
   cancelBeforeEndTimeMs: parseInt(process.env.CANCEL_BEFORE_END_TIME_MS || "10000"),
   polygonRpcUrl: process.env.POLY_RPC_URL || "https://polygon-rpc.com",
+  maxPriceVolatility: parseFloat(process.env.MAX_PRICE_VOLATILITY || "0.05"),
+  minHistoryForFilter: parseInt(process.env.MIN_HISTORY_FOR_FILTER || "10"),
 };
 
 export function getConfig(): Config {
