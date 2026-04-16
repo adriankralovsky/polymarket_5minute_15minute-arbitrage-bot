@@ -140,15 +140,38 @@ export class SimulationEngine {
             result.unresolvedTrades++;
             logDebug(`Trade at ${timestamp} is unresolved (market still PENDING) — skipping PnL`);
           } else {
-            // Standard two-leg arb guarantee:
-            // We hold one UP token and one DOWN token with the same endTime.
-            // Exactly one always pays out 1.0 USDC regardless of direction.
-            // Therefore profit = 1.0 - sumPrice on every filled, resolved trade.
+            // Compute actual payout by checking each leg against the real resolution.
             //
-            // The only real loss case is a partial fill / unwind, which the
-            // SimulatedTradeExecutor always marks as "filled" for simulation
-            // purposes. Genuine execution failures are counted in failedTrades.
-            const tradePnL = 1.0 - opportunity.prices.sumPrice;
+            // UP leg pays $1 if the market we bought UP in actually resolved UP.
+            // DOWN leg pays $1 if the market we bought DOWN in actually resolved DOWN.
+            //
+            // For synchronized markets (same endTime, the bot's core precondition):
+            //   • Cases A & B: payout is $1 if BTC is outside the beat-price gap,
+            //     or $2 if BTC lands between the two beat prices (both legs win).
+            //   • Case C (equal beats): exactly one leg always pays → always $1.
+            //
+            // We use the actual finalResult rather than hardcoding $1 so that:
+            //   1. The Case A/B double-win windfall is correctly captured.
+            //   2. Any bad-data edge case (mismatched endTimes) shows a realistic $0
+            //      rather than an incorrect $1 credit.
+            const dir = opportunity.direction!;
+            const upPayout =
+              (dir.upMarket === "5m"  && finalResult5m  === "UP")  ||
+              (dir.upMarket === "15m" && finalResult15m === "UP")
+                ? 1.0 : 0.0;
+            const downPayout =
+              (dir.downMarket === "5m"  && finalResult5m  === "DOWN") ||
+              (dir.downMarket === "15m" && finalResult15m === "DOWN")
+                ? 1.0 : 0.0;
+
+            const totalPayout = upPayout + downPayout;
+            const tradePnL = totalPayout - opportunity.prices.sumPrice;
+
+            logDebug(
+              `Trade resolved: upPayout=${upPayout} downPayout=${downPayout} ` +
+              `totalPayout=${totalPayout} sumPrice=${opportunity.prices.sumPrice.toFixed(4)} ` +
+              `pnl=${tradePnL.toFixed(4)}`,
+            );
 
             cumulativePnL += tradePnL;
             result.totalPnL = cumulativePnL;
