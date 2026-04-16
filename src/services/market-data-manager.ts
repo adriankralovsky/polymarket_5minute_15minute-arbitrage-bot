@@ -1021,9 +1021,10 @@ export class MarketDataManager {
    * Check if data is stale
    */
   isDataStale(market: MarketData): boolean {
-    const lastUpdate = market.priceHistory[market.priceHistory.length - 1]?.timestamp || 0;
-    const age = Date.now() - lastUpdate;
-    return age > this.config.maxDataAgeMs;
+    // No history yet = market just initialized, not stale
+    if (market.priceHistory.length === 0) return false;
+    const lastUpdate = market.priceHistory[market.priceHistory.length - 1].timestamp;
+    return Date.now() - lastUpdate > this.config.maxDataAgeMs;
   }
 
   /**

@@ -9,7 +9,24 @@ import { retry } from "../utils/retry";
 
 const CLOB_HOST = "https://clob.polymarket.com";
 const CHAIN_ID = 137; // Polygon
-const POLYGON_RPC = process.env.POLY_RPC_URL || "https://polygon-rpc.com";
+
+/**
+ * Build an ethers provider from POLY_RPC_URL.
+ * Supports a comma-separated list of URLs for automatic fallback:
+ *   POLY_RPC_URL=https://primary-rpc.com,https://fallback-rpc.com
+ * With multiple URLs, FallbackProvider is used (tries each in order of priority).
+ */
+function buildPolygonProvider(): ethers.JsonRpcProvider | ethers.FallbackProvider {
+  const raw = process.env.POLY_RPC_URL || "https://polygon-rpc.com";
+  const urls = raw.split(",").map((u) => u.trim()).filter(Boolean);
+  if (urls.length === 1) {
+    return new ethers.JsonRpcProvider(urls[0]);
+  }
+  const providers = urls.map((url, i) =>
+    ({ provider: new ethers.JsonRpcProvider(url), priority: urls.length - i, stallTimeout: 2000 })
+  );
+  return new ethers.FallbackProvider(providers, CHAIN_ID);
+}
 
 // ERC20 approve ABI
 const ERC20_APPROVE_ABI = [
@@ -103,7 +120,7 @@ export interface ClobOrderResponse {
 export class ClobClient {
   private privateKey: string;
   private wallet: ethers.Wallet;
-  private provider: ethers.JsonRpcProvider;
+  private provider: ethers.JsonRpcProvider | ethers.FallbackProvider;
   private signatureType: number;
   private funder: string | null = null;
   private apiKey: string | null = null;
@@ -117,7 +134,7 @@ export class ClobClient {
     }
 
     this.privateKey = key.startsWith("0x") ? key : `0x${key}`;
-    this.provider = new ethers.JsonRpcProvider(POLYGON_RPC);
+    this.provider = buildPolygonProvider();
     this.wallet = new ethers.Wallet(this.privateKey, this.provider);
 
     // Wallet type configuration

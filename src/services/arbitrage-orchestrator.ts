@@ -10,6 +10,7 @@ import { TradeExecutor, UnwindFailedError } from "./trade-executor";
 import { DatabaseService } from "./database";
 import { JsonLogger } from "./json-logger";
 import { logInfo, logError, logWarn, logDebug, logSyncDetected } from "../utils/logger";
+import { sendCriticalAlert } from "../utils/alert";
 import { getConfig } from "../config";
 import type { MarketData, ArbitrageOpportunity, TradeExecution } from "../types";
 
@@ -386,6 +387,10 @@ export class ArbitrageOrchestrator {
         } catch (dbErr) {
           logError("Failed to persist unwind-failure record:", dbErr);
         }
+        await sendCriticalAlert(
+          `**UNWIND FAILED — bot halted. Naked position may exist.**\n\`\`\`\n${error.message}\n\`\`\`\n` +
+          `Market 5m: ${market5m.marketId}\nMarket 15m: ${market15m.marketId}`,
+        );
         await this.stop();
         return;
       }
