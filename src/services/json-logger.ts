@@ -153,7 +153,13 @@ export class JsonLogger {
   }
 
   /**
-   * Log final resolution
+   * Log final resolution.
+   *
+   * Must patch the EXISTING log file rather than creating a new one.
+   * If the bot was restarted between when trades were logged and when the
+   * market resolved, currentLogs is empty. getOrCreateLog would create a
+   * blank record and overwrite the real file (wiping tradeAttempts /
+   * priceTimeline). We load from disk first if the key is missing.
    */
   logFinalResolution(
     market5m: MarketData,
@@ -164,6 +170,21 @@ export class JsonLogger {
   ): void {
     if (!this.config.enableJsonLogs) return;
 
+    const pairId = `${market5m.marketId}-${market15m.marketId}`;
+
+    // If not in memory, try to load from disk so we don't overwrite real data.
+    if (!this.currentLogs.has(pairId)) {
+      const filename = `market-pair-${pairId}-${market5m.endTime}.json`;
+      const filepath = path.join(this.logDir, filename);
+      if (fs.existsSync(filepath)) {
+        const loaded = this.loadHistoricalLog(filepath);
+        if (loaded) {
+          this.currentLogs.set(pairId, loaded);
+          logDebug(`Loaded existing log from disk for resolution: ${filename}`);
+        }
+      }
+    }
+
     const log = this.getOrCreateLog(market5m, market15m);
     log.finalResolution = {
       finishPrice,
@@ -171,9 +192,7 @@ export class JsonLogger {
       result15m,
     };
 
-    // Calculate realized PnL
     log.realizedPnL = this.calculateRealizedPnL(log);
-
     this.saveLog(log);
   }
 
